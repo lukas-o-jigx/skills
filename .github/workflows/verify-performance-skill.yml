@@ -18,3 +18,4 @@ jobs:
           python-version: '3.12'
       - run: node --test skills/jigx-performance/scripts/check-performance.test.mjs
       - run: python3 -m unittest skills/jigx-performance/scripts/test_profile_query.py
+      - run: python3 -m unittest skills/jigx-performance/scripts/test_load_tools.py

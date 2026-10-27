@@ -28,3 +28,5 @@ Ship one change at a time and prove it with evidence a reviewer can check.
    real data, with non-zero row counts asserted both sides.
 5. Ship one change at a time. Verify the index by name and expression in `sqlite_master`, the query's
    output before and after, and a live write through the indexed table.
+6. Time the affected load or screen before and after (`run-and-track.md`): medians of three runs a
+   side, equal final row counts, no new `Timeout for first snapshot` lines. Put the comparison in the PR.

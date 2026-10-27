@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Track a Jigx sync or screen load live from the simulator's SQLite database.
+
+Standard library only. Opens the solution database and the runtime log database
+read-only (`?mode=ro`) and never writes to them. Every --interval seconds it reads:
+
+  * `_syncScope`: each scope's state and the state of each entry in `details`
+  * the SDK `_commandQueue` size
+  * row counts for any --table you name
+  * new WARNING/ERROR runtime log lines, e.g. "Timeout for first snapshot"
+
+It prints one live line per change, appends every changed sample to
+<out>/<label>-samples.jsonl, and stops when the load is ready (every tracked scope
+synced and the queue empty for --settle seconds), failed, or timed out. It then
+writes <out>/<label>-summary.json with the time from the first scope start to
+ready, per-scope and per-entry durations, a waterfall, final counts and log
+signals. Compare runs with compare-runs.py.
+
+Only entry states are kept from `details`: it also holds function parameters,
+which can carry URLs and credentials. Log lines keep level, category and a
+redacted message; `additionalParameters` is never read.
+
+Simulator only: a real device's files are not reachable from the host, and the
+debug bridge (~5 s per query) is too slow to time anything. Read
+references/run-and-track.md.
+
+Examples:
+  python3 track-load.py --list
+  python3 track-load.py --solution my-solution-test --label pre-1 --table orders
+  python3 track-load.py --db path/to/jigx.solution.___x___.<uuid>.db --scopes sync-base,sync-lookups
+"""
+import argparse
+import contextlib
+import datetime
+import glob
+import json
+import os
+import platform
+import re
+import sqlite3
+import sys
+import time
+
+SIMULATORS = os.path.expanduser("~/Library/Developer/CoreSimulator/Devices")
+DB_GLOB = "data/Containers/Data/Application/*/Library/LocalDatabase/jigx.solution.___{name}___.*.db"
+SECRET = re.compile(r"((?:Basic|Bearer)\s+)[A-Za-z0-9+/=._~-]+|((?:token|password|secret|apikey|api_key)[\"']?\s*[:=]\s*[\"']?)[^\s\"',}]+", re.I)
+
+
+def redact(text):
+    return SECRET.sub(lambda m: (m.group(1) or m.group(2)) + "***", text)
+
+
+def now_ms():
+    return time.time() * 1000
+
+
+def iso(ms):
+    return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def solution_dbs(name="*"):
+    return sorted(glob.glob(os.path.join(SIMULATORS, "*", DB_GLOB.format(name=name))), key=os.path.getmtime, reverse=True)
+
+
+def solution_name(path):
+    m = re.search(r"jigx\.solution\.___(.+?)___\.", os.path.basename(path))
+    return m.group(1) if m else os.path.basename(path)
+
+
+def connect(path):
+    """Read-only connection that closes on exit (sqlite3's own context manager only commits)."""
+    return contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2))
+
+
+def read_state(path, tables):
+    with connect(path) as conn:
+        scopes = {}
+        for sid, state, details, started, synced in conn.execute(
+                "SELECT id, state, details, lastStartedAt, lastSyncedAt FROM _syncScope"):
+            try:
+                entries = {k: (v or {}).get("state") for k, v in json.loads(details or "{}").items()}
+            except (ValueError, AttributeError):
+                entries = {}
+            scopes[sid] = {"state": state, "startedAt": started, "syncedAt": synced, "entries": entries}
+        queue = conn.execute("SELECT COUNT(*) FROM _commandQueue").fetchone()[0]
+        counts = {}
+        for table in tables:
+            try:
+                counts[table] = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            except sqlite3.Error:
+                counts[table] = None
+    return {"scopes": scopes, "queue": queue, "counts": counts}
+
+
+def read_logs(path, after_id, since_ms):
+    """New WARNING/ERROR log lines from jigx.log.db; returns (rows, last id)."""
+    rows, last = [], after_id
+    try:
+        with connect(path) as conn:
+            for rid, ts, message in conn.execute(
+                    "SELECT id, timestamp, message FROM _logMessages WHERE id > ? AND timestamp >= ? ORDER BY id",
+                    (after_id, since_ms)):
+                last = rid
+                try:
+                    m = json.loads(message)
+                except ValueError:
+                    continue
+                rows.append({"at": iso(ts), "level": m.get("level"), "category": m.get("category"),
+                             "message": redact(str(m.get("message", "")))[:300]})
+    except sqlite3.Error:
+        pass
+    return rows, last
+
+
+def tracked(state, scopes, armed):
+    """Scopes that count for this run: the named ones, or every scope started after arming."""
+    all_scopes = state["scopes"]
+    if scopes:
+        return {s: all_scopes.get(s) for s in scopes}
+    return {s: v for s, v in all_scopes.items() if (v["startedAt"] or 0) >= armed}
+
+
+def fresh(v, armed):
+    return bool(v) and (v["startedAt"] or 0) >= armed
+
+
+def status(state, scopes, armed):
+    run = tracked(state, scopes, armed)
+    started = [v for v in run.values() if fresh(v, armed)]
+    if not started:
+        return "waiting"
+    if any(v["state"] in ("failed", "interrupted") or "failed" in v["entries"].values() for v in started):
+        return "failed"
+    if len(started) == len(run) and state["queue"] == 0 and all(
+            v["state"] == "synced" and all(e == "synced" for e in v["entries"].values()) for v in started):
+        return "ready"
+    return "loading"
+
+
+def live_line(elapsed, state, scopes, armed):
+    parts = []
+    for sid, v in sorted(tracked(state, scopes, armed).items()):
+        if not v:
+            parts.append(f"{sid}: -")
+            continue
+        entries = list(v["entries"].values())
+        parts.append(f"{sid}: {v['state']} {entries.count('synced')}/{len(entries)}"
+                     + (f" ({entries.count('failed')} failed)" if "failed" in entries else "")
+                     + ("" if fresh(v, armed) else " (from before arming)"))
+    counts = " ".join(f"{t}={c}" for t, c in state["counts"].items())
+    return f"{elapsed:7.2f}s  " + " | ".join(parts or ["no scope started yet"]) + f"  queue={state['queue']}  {counts}"
+
+
+def entry_timings(samples, armed):
+    """First sample an entry was seen syncing (or any state) to the first sample it was synced."""
+    first_seen, started, finished, failed = {}, {}, {}, set()
+    for s in samples:
+        t = s["t"]
+        for sid, v in s["scopes"].items():
+            if not fresh(v, armed):
+                continue
+            for key, st in v["entries"].items():
+                name = f"{sid}/{key}"
+                first_seen.setdefault(name, t)
+                if st == "syncing":
+                    started.setdefault(name, t)
+                if st == "synced" and name not in finished:
+                    finished[name] = t
+                if st == "failed":
+                    failed.add(name)
+    out = {}
+    for name in first_seen:
+        start = started.get(name, first_seen[name])
+        end = finished.get(name)
+        out[name] = {"start_s": round(start, 2), "end_s": round(end, 2) if end is not None else None,
+                     "duration_s": round(end - start, 2) if end is not None else None,
+                     "failed": name in failed}
+    return dict(sorted(out.items(), key=lambda kv: (kv[1]["start_s"], kv[0])))
+
+
+def waterfall(entries, width=40):
+    ends = [e["end_s"] for e in entries.values() if e["end_s"] is not None]
+    span = max(ends or [1]) or 1
+    lines = []
+    for name, e in entries.items():
+        end = e["end_s"] if e["end_s"] is not None else span
+        a, b = int(e["start_s"] / span * width), max(int(end / span * width), int(e["start_s"] / span * width) + 1)
+        mark = "x" if e["failed"] else "#"
+        dur = f"{e['duration_s']:.2f}s" if e["duration_s"] is not None else "unfinished"
+        lines.append(f"{name[:48]:48} {' ' * a}{mark * (b - a)}{' ' * (width - b)} {e['start_s']:6.2f}s +{dur}")
+    return lines
+
+
+def summarise(label, db, samples, result, armed, ready_at, logs, final, scopes):
+    run = tracked(final, scopes, armed) if final else {}
+    starts = [v["startedAt"] for v in run.values() if v and v["startedAt"]]
+    first_start = min(starts) if starts else None
+    entries = entry_timings(samples, armed)
+    snapshot = {}
+    for row in logs:
+        m = re.search(r"'([^']+)' Timeout for first snapshot", row["message"])
+        if m:
+            snapshot[m.group(1)] = snapshot.get(m.group(1), 0) + 1
+    return {
+        "label": label,
+        "machine": f"host {platform.node()} {platform.machine()} {platform.system()} (iOS Simulator)",
+        "solution": solution_name(db),
+        "armed_at": iso(armed),
+        "result": result,
+        "first_start_to_ready_s": round((ready_at - first_start) / 1000, 2) if ready_at and first_start else None,
+        "arm_to_ready_s": round((ready_at - armed) / 1000, 2) if ready_at else None,
+        "scopes": {sid: {"state": v["state"],
+                         "duration_s": round((v["syncedAt"] - v["startedAt"]) / 1000, 2)
+                         if v and v["syncedAt"] and v["startedAt"] and v["syncedAt"] >= v["startedAt"] else None}
+                   for sid, v in run.items() if v},
+        "entries": entries,
+        "slowest_entries": sorted(((n, e["duration_s"]) for n, e in entries.items() if e["duration_s"] is not None),
+                                  key=lambda x: -x[1])[:10],
+        "final_counts": final["counts"] if final else {},
+        "snapshot_timeouts": snapshot,
+        "log_errors": sum(1 for r in logs if r["level"] == "ERROR"),
+        "log_warnings": sum(1 for r in logs if r["level"] == "WARNING"),
+        "sample_interval_note": "Entry times have the resolution of the sampling interval; scope durations use the runtime's own timestamps.",
+    }
+
+
+def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeout=900.0, stream=sys.stdout):
+    os.makedirs(out, exist_ok=True)
+    log_db = os.path.join(os.path.dirname(db), "jigx.log.db")
+    armed = now_ms()
+    samples, logs, last_sig, last_log = [], [], None, 0
+    # skip log lines written before arming
+    _, last_log = read_logs(log_db, 0, armed)
+    result, ready_since, ready_at, final = "timeout", None, None, None
+    print(f"Tracking {solution_name(db)} as '{label}'. Start the load now (log in, refresh or open the screen).",
+          file=stream, flush=True)
+    with open(os.path.join(out, f"{label}-samples.jsonl"), "w", encoding="utf-8") as jsonl:
+        while now_ms() - armed < timeout * 1000:
+            t = (now_ms() - armed) / 1000
+            try:
+                state = read_state(db, tables)
+            except sqlite3.Error:
+                time.sleep(interval)
+                continue
+            final = state
+            new_logs, last_log = read_logs(log_db, last_log, armed)
+            for row in new_logs:
+                logs.append(row)
+                print(f"{t:7.2f}s  LOG {row['level']} {row['category']}: {row['message'][:140]}", file=stream, flush=True)
+            sig = json.dumps(state, sort_keys=True)
+            if sig != last_sig:
+                last_sig = sig
+                samples.append({"t": t, **state})
+                jsonl.write(json.dumps({"at": iso(now_ms()), "t": round(t, 3), **state}) + "\n")
+                jsonl.flush()
+                print(live_line(t, state, scopes, armed), file=stream, flush=True)
+            st = status(state, scopes, armed)
+            if st == "failed":
+                result = "failed"
+                break
+            if st == "ready":
+                if ready_since is None:
+                    ready_since = now_ms()
+                    run = tracked(state, scopes, armed)
+                    ready_at = max([v["syncedAt"] or 0 for v in run.values()] + [0]) or ready_since
+                if now_ms() - ready_since >= settle * 1000:
+                    result = "ready"
+                    break
+            else:
+                ready_since, ready_at = None, None
+            time.sleep(interval)
+    summary = summarise(label, db, samples, result, armed, ready_at if result == "ready" else None, logs, final, scopes)
+    with open(os.path.join(out, f"{label}-summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    total = summary["first_start_to_ready_s"]
+    print("\n".join(["", f"{label}: {result}, first start to ready {'n/a' if total is None else f'{total}s'}", ""]
+                    + waterfall(summary["entries"])), file=stream)
+    if summary["snapshot_timeouts"]:
+        print(f"Timeout for first snapshot: {summary['snapshot_timeouts']}", file=stream)
+    print(f"Saved {os.path.join(out, label + '-summary.json')}", file=stream, flush=True)
+    return summary
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--list", action="store_true", help="list solution databases in local simulators, newest first")
+    p.add_argument("--db", help="path to a jigx.solution.___<name>___.<uuid>.db file")
+    p.add_argument("--solution", help="solution name; finds the newest matching simulator database")
+    p.add_argument("--label", default=datetime.datetime.now().strftime("run-%H%M%S"),
+                   help="run label; prefix with pre-/post- for compare-runs.py")
+    p.add_argument("--out", default="perf-runs")
+    p.add_argument("--table", action="append", default=[], help="table to count each sample; repeatable")
+    p.add_argument("--scopes", default="", help="comma-separated sync scope ids that define ready; default: every scope started after arming")
+    p.add_argument("--interval", type=float, default=0.25)
+    p.add_argument("--settle", type=float, default=5.0, help="seconds ready must hold before stopping")
+    p.add_argument("--timeout", type=float, default=900.0)
+    args = p.parse_args(argv)
+    if args.list:
+        for path in solution_dbs():
+            print(f"{solution_name(path):40} {datetime.datetime.fromtimestamp(os.path.getmtime(path)):%Y-%m-%d %H:%M}  {path}")
+        return 0
+    db = args.db
+    if not db and args.solution:
+        found = solution_dbs(args.solution)
+        if not found:
+            p.error(f"no simulator database for solution '{args.solution}'; run --list")
+        db = found[0]
+    if not db:
+        p.error("give --db or --solution (see --list)")
+    scopes = [s for s in args.scopes.split(",") if s]
+    summary = track(db, args.label, args.out, args.table, scopes, args.interval, args.settle, args.timeout)
+    return 0 if summary["result"] == "ready" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

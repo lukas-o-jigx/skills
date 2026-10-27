@@ -104,8 +104,9 @@ REST/OData functions, `acuerp` tokens, `acumaticaURL` casing, lookup expands,
 local-first sync, command queue retry, file upload, PDF attachment, and service order
 submission patterns.
 
-Run it as `/jigx-performance audit [solution path]` or `/jigx-performance build` in
-Claude Code, or let it load on its own: use `jigx-performance` with `jigx` when a screen is slow or logs
+Run it as `/jigx-performance audit [solution path]`, `/jigx-performance build` or
+`/jigx-performance measure [test solution]` in Claude Code, or let it load on its own:
+use `jigx-performance` with `jigx` when a screen or sync is slow or logs
 `Timeout for first snapshot`, when auditing a solution, or when writing a
 `datasource.sqlite` query, an `action.execute-sql` index, or a list whose items read
 datasources.
@@ -140,8 +141,10 @@ against an exported device database:
 ```sh
 node skills/jigx-performance/scripts/check-performance.mjs /path/to/solution/build/output.json
 python3 skills/jigx-performance/scripts/profile-query.py device.db query.sql --scale 10 --ddl index.sql
+python3 skills/jigx-performance/scripts/check-plans.py /path/to/solution/build/output.json --scans-only
 node --test skills/jigx-performance/scripts/check-performance.test.mjs
 python3 -m unittest skills/jigx-performance/scripts/test_profile_query.py
+python3 -m unittest skills/jigx-performance/scripts/test_load_tools.py
 ```
 
 The scan flags per-row datasource reads in list items, uncapped search lists,
@@ -149,4 +152,17 @@ filter predicates no shipped index matches, `execute-sql` shape and DDL risks, a
 JSONata comparison traps. Its findings are leads to measure, not verdicts. The
 profiler works on a copy, reports row and byte counts, the query plan and timings
 at 1x and scaled data, before and after DDL, and can diff a rewrite against the
-original. Host timings show relative cost; they are not device timings.
+original. Host timings show relative cost; they are not device timings. The plan
+check lists full scans and unused indexes, and fails CI through a guard file when a
+named lookup starts scanning.
+
+Time a change by tracking the real load in the iOS Simulator, three runs before and
+three after, then compare the medians:
+
+```sh
+python3 skills/jigx-performance/scripts/track-load.py --solution <test-solution> --label pre-1
+python3 skills/jigx-performance/scripts/compare-runs.py perf-runs --before pre --after post
+```
+
+The tracker reads the simulator's database read-only, prints the load live, and saves
+a summary with a waterfall of sync entries. The comparison flags slowdowns over 10%.

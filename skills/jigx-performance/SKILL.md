@@ -1,6 +1,6 @@
 ---
 name: jigx-performance
-description: Use when a Jigx screen or list is slow, stalls or logs "Timeout for first snapshot", when auditing an existing solution for performance, or when writing or changing a datasource.sqlite query, an action.execute-sql index, or a list whose items read datasources. Covers measuring on-device SQLite cost, expression indexes, shipping DDL safely, list query shape, per-row datasource reads, SQL-to-JSONata traps and verifying a change. Use together with the generic `jigx` skill.
+description: Use when a Jigx screen, list or sync is slow, stalls or logs "Timeout for first snapshot", when auditing an existing solution for performance, when timing a load before and after a change, or when writing or changing a datasource.sqlite query, an action.execute-sql index, or a list whose items read datasources. Covers measuring on-device SQLite cost, live load tracking and before/after comparison, expression indexes and query-plan guards, shipping DDL safely, list query shape and components, state and expression cost, screen size, and verifying a change. Use together with the generic `jigx` skill.
 ---
 
 # Jigx Performance
@@ -16,14 +16,16 @@ an index adds to write cost.
 
 ## Pick the mode
 
-Invoked as `/jigx-performance audit [solution path]` or `/jigx-performance build`, use
-that mode. Invoked with no argument, or loaded from the task, pick by the request:
+Invoked as `/jigx-performance audit [solution path]`, `/jigx-performance build` or
+`/jigx-performance measure [test solution]`, use that mode. Invoked with no argument, or loaded from the task, pick by the request:
 
 - **Audit an existing solution**: the user reports a slow screen, or asks for a
   performance review. Follow "Audit" below. Default the solution path to the current
   project and its `build/output.json`; build first if that file is missing.
 - **Build or change a solution**: a new or changed `datasource.sqlite`,
   `action.execute-sql`, or list. Follow "Build" below.
+- **Measure a change**: the user wants before/after times or to watch a load. Follow
+  "Measure" below.
 
 ## Audit
 
@@ -35,7 +37,12 @@ that mode. Invoked with no argument, or loaded from the task, pick by the reques
 
    It reports per-row datasource reads in list items, uncapped search lists, filter
    predicates that no shipped index matches, `execute-sql` shape and DDL risks, and
-   JSONata comparison traps. Every finding is a lead to measure, not a verdict.
+   JSONata comparison traps. Every finding is a lead to measure, not a verdict. Then
+   list full scans and unused indexes from the query planner:
+
+   ```sh
+   python3 <skill-directory>/scripts/check-plans.py build/output.json --scans-only
+   ```
 2. Read `references/measuring.md`. Get row **and byte** counts for the tables behind
    the slow screen on a real device, then export those tables.
 3. Profile the slow query on the host at 1x and 10x:
@@ -46,9 +53,12 @@ that mode. Invoked with no argument, or loaded from the task, pick by the reques
 
    It prints the SQLite version, row and byte counts per table, the query plan and
    median timings. Attribute cost per CTE and per predicate before proposing a fix.
-4. Fix the largest measured cost first, one change at a time, using the references
-   below. Prefer an index to a rewrite.
-5. Verify per `references/verifying.md` and report what was and was not reproduced.
+4. Group findings by section (A–H in `references/recipe-index.md`) and review the
+   sections the scripts cannot see (state, expressions, screen size, start-up).
+5. Fix the largest measured cost first, one section and one change at a time, using
+   the references below. Prefer an index to a rewrite.
+6. Verify per `references/verifying.md`, time it per `references/run-and-track.md`, and
+   report what was and was not reproduced.
 
 ## Build
 
@@ -57,19 +67,38 @@ that mode. Invoked with no argument, or loaded from the task, pick by the reques
    index per `references/indexes-and-execute-sql.md`.
 3. Resolve datasource views once in `expressions:` rather than per list-item row.
 4. Cast numeric SQL columns that feed `when:` guards.
-5. Run `check-performance.mjs` alongside the `jigx` runtime checker before publishing,
-   and profile any query over a table that can exceed a few thousand rows at 1x and
-   10x with `profile-query.py`.
+5. Run `check-performance.mjs` and `check-plans.py` alongside the `jigx` runtime
+   checker before publishing, and profile any query over a table that can exceed a few
+   thousand rows at 1x and 10x with `profile-query.py`.
+6. Add a `check-plans.py --guard` entry for every lookup that runs per row or per
+   change, so a later edit cannot silently bring the scan back.
+
+## Measure
+
+1. Publish the build to a **test** solution (`jigx_debug` `create_debug_session`) in the
+   iOS Simulator. Never time against production.
+2. Run `scripts/track-load.py` before each load: three runs on the old build
+   (`--label pre-1..3`), three on the new one (`post-1..3`), same data and simulator.
+   It prints the load live and saves a summary and a waterfall per run.
+3. Run `scripts/compare-runs.py` and put its `comparison.md` in the PR. Investigate any
+   slowdown over 10%, new `Timeout for first snapshot` lines or changed row counts.
+   Read `references/run-and-track.md`.
 
 ## Reference map
 
 - `references/recipe-index.md` - when to read each reference.
 - `references/measuring.md` - attributing cost, host vs device, bytes vs rows, the
   debug bridge, where the time goes on blob-carrying JSON columns.
+- `references/run-and-track.md` - live load timeline in the simulator, three runs a
+  side, medians and the slowdown threshold, what can be timed where.
 - `references/indexes-and-execute-sql.md` - expression indexes, matching predicate
-  text, shipping DDL through `action.execute-sql`, gating, verifying in `sqlite_master`.
-- `references/query-shape-and-lists.md` - capped and pinned lists, sort keys, per-row
-  datasource reads, keyed lookups, SQL to JSONata traps.
+  text, `OR` across keys, materialised CTEs, plan guards, unused indexes, shipping DDL
+  through `action.execute-sql`, gating, verifying in `sqlite_master`.
+- `references/query-shape-and-lists.md` - capped and pinned lists, sort keys, shaping
+  in SQL, `rewriteQuery`, list components, per-row datasource reads, keyed lookups, SQL
+  to JSONata traps.
+- `references/state-and-screens.md` - unused datasources, watched tables, state,
+  shared expressions, screen size, start-up work, fix order.
 - `references/verifying.md` - equivalence checks, real-data diffs, what host SQLite
   cannot catch, the checklist.
 
@@ -79,6 +108,12 @@ that mode. Invoked with no argument, or loaded from the task, pick by the reques
   Exits nonzero only on errors; most findings are warnings to investigate.
 - `scripts/profile-query.py` - standard-library profiler for an exported SQLite
   database: counts, bytes, plan, timings, optional synthetic scale-up on a copy.
+- `scripts/check-plans.py` - query plans for every datasource and `execute-sql` read
+  against the shipped indexes: full scans, indexes used and unused, CI guard file.
+- `scripts/track-load.py` - read-only live tracker of a sync or load in the iOS
+  Simulator: scopes, entries, queue, row counts, slow-datasource log lines, waterfall.
+- `scripts/compare-runs.py` - medians and per-scope and per-entry change between
+  before and after runs, with warnings for weak comparisons.
 
 ## Guardrails
 
@@ -90,3 +125,6 @@ that mode. Invoked with no argument, or loaded from the task, pick by the reques
 - Do not trust a successful sync as evidence that DDL worked; check `sqlite_master`.
 - Do not claim a device improvement from host timings. Label every timing with the
   machine it ran on, and say what was not reproduced.
+- Do not claim a speed-up from one run, from query plans alone, or from a load that
+  fetched fewer rows. Compare medians of three runs a side with equal final counts.
+- Do not run timing loads against a production solution or a working user's device.
