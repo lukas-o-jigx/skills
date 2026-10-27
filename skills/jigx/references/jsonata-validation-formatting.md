@@ -14,6 +14,21 @@ Common rules:
   screen inputs are the source of truth
 - use projected datasource fields for dropdown `value`
 
+## Null-Safe Expressions
+
+String and number functions throw on a missing value. Left-joined columns and optional
+fields are missing often; in one audit a single `$contains` on a left-joined status in a
+list item produced hundreds of runtime errors. Guard by type and choose a fallback by
+meaning:
+
+```yaml
+when: =$contains(($type(@ctx.current.item.status)='string'?@ctx.current.item.status:''), 'Open')
+text: =$type(@ctx.current.item.Amount)='number' ? $formatNumber(@ctx.current.item.Amount,'#,##0.00') : '-'
+```
+
+Show "Unknown" or "-" rather than a blank. Apply the same to `$substring`, `$lowercase`,
+`$uppercase`, `$trim`, `$number`, `$round` and `$length`.
+
 ## Dropdowns
 
 Dropdowns should:
