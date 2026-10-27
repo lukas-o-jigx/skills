@@ -24,6 +24,7 @@ def module(name, file):
 tl = module("track_load", "track-load.py")
 cr = module("compare_runs", "compare-runs.py")
 cp = module("check_plans", "check-plans.py")
+rr = module("review_report", "review-report.py")
 
 
 class TrackLoadTest(unittest.TestCase):
@@ -179,6 +180,41 @@ class CheckPlansTest(unittest.TestCase):
         report = cp.check_plans(app(OR_LOOKUP), guard={"nope": {"no_scan": ["header"]}})
         self.assertEqual(report["guard_failures"], ["nope: no query found"])
         self.assertEqual(cp.table_refs("SELECT 1 FROM [orders] AS o JOIN json_each(o.data) j"), {"orders": "orders", "o": "orders"})
+
+
+class ReviewReportTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        for side in ("before", "after", "runs"):
+            os.makedirs(os.path.join(self.dir, side))
+
+    def tearDown(self):
+        shutil.rmtree(self.dir)
+
+    def write(self, rel, value):
+        with open(os.path.join(self.dir, rel), "w") as f:
+            json.dump(value, f)
+
+    def test_baseline_overview_then_before_after_report(self):
+        self.write("before/static.json", {"byCode": {"unindexed-predicate": 4, "per-row-datasource-read": 2}})
+        self.write("before/plans.json", {"queries_with_full_scans": 5, "indexes_unused": ["a"], "indexes_failed": []})
+        baseline = rr.report(self.dir, "demo")
+        self.assertIn("Baseline only", baseline)
+        self.assertIn("| C | Lists and rendering | per-row-datasource-read | 2 |", baseline)
+        self.assertIn("No before/after load timing", baseline)
+
+        self.write("after/static.json", {"byCode": {"unindexed-predicate": 1}})
+        self.write("after/plans.json", {"queries_with_full_scans": 1, "indexes_unused": [], "indexes_failed": []})
+        self.write("changes.json", [{"section": "B", "change": "Index orders by reference", "files": ["x.jigx"]}])
+        self.write("runs/comparison.json", cr.compare(
+            [run("pre-1", 20, 5), run("pre-2", 22, 5), run("pre-3", 30, 5)],
+            [run("post-1", 10, 2), run("post-2", 11, 2), run("post-3", 12, 2)]))
+        text = rr.report(self.dir, "demo")
+        self.assertIn("**Time to ready: 22 s → 11 s (-50.0%, improved)**", text)
+        self.assertIn("| C | Lists and rendering | per-row-datasource-read | 2 | 0 |", text)
+        self.assertIn("| B | Queries and indexes | queries with full scans | 5 | 1 |", text)
+        self.assertIn("- Index orders by reference (x.jigx)", text)
+        self.assertIn("| entry: sync-base/a | 5 s | 2 s | -60.0% |", text)
 
 
 if __name__ == "__main__":

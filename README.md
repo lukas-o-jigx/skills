@@ -111,6 +111,41 @@ use `jigx-performance` with `jigx` when a screen or sync is slow or logs
 `datasource.sqlite` query, an `action.execute-sql` index, or a list whose items read
 datasources.
 
+## Review a customer solution for performance
+
+Install the skills (above), open the customer's solution project in Claude Code and
+run:
+
+```text
+/jigx-performance review path/to/solution
+```
+
+Claude asks once for the **test** solution to publish to, the journey to time (sign-in
+and initial sync, a refresh, or a screen) and the test data, then:
+
+1. **Measures the baseline.** It scans the generated solution and records three timed
+   loads in the iOS Simulator, showing the sync live as it runs.
+2. **Gives an overview and proposes changes.** Time to ready, the slowest sync steps,
+   and findings grouped into sections A–H (measuring, queries and indexes, lists, state
+   and expressions, screens and start-up, sync, writes and duplicates, security and
+   logs). Each proposed change says where, why, the expected effect and the risk.
+3. **Waits for your approval.** Nothing changes until you say which sections to apply.
+4. **Applies the approved sections**, one commit per section, rebuilding and checking
+   after each.
+5. **Measures again and reports.** Three more timed loads with the same data, then
+   `perf-review/report.md`: time to ready before and after, which steps got faster or
+   slower, slow-datasource warnings and errors, findings per section before and after,
+   and what was not verified.
+
+Requirements: Node 18+, Python 3.9+, Xcode with an iOS Simulator, the Jigx app in the
+simulator, and the `jigx_debug` MCP server for publishing to the test solution. Timing
+runs never touch production; simulator times show relative change, so confirm big wins
+on a real device. Results stay in `perf-review/` in the solution project.
+
+Other modes: `/jigx-performance audit` (findings only), `/jigx-performance build` (while
+writing new queries and lists) and `/jigx-performance measure` (time a change you made
+yourself).
+
 ## Verify generated solutions
 
 The Jigx skill includes a dependency-free checker for known mobile runtime
@@ -145,6 +180,7 @@ python3 skills/jigx-performance/scripts/check-plans.py /path/to/solution/build/o
 node --test skills/jigx-performance/scripts/check-performance.test.mjs
 python3 -m unittest skills/jigx-performance/scripts/test_profile_query.py
 python3 -m unittest skills/jigx-performance/scripts/test_load_tools.py
+python3 skills/jigx-performance/scripts/review-report.py perf-review --solution <name>
 ```
 
 The scan flags per-row datasource reads in list items, uncapped search lists,
