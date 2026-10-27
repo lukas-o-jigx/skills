@@ -29,6 +29,45 @@ Prefer an index to a rewrite, and ship it so a failure cannot go unnoticed. `scr
 - **Check the planner isn't already doing it.** Pushing a filter into each arm of a union, and fencing
   a multi-reference CTE with `LIMIT 2147483647`, are both things SQLite already does (the fence is a
   no-op on ≥ 3.35). Read the plan before writing the optimisation.
+- **An `OR` across several keys scans unless every arm has a matching index.** SQLite can
+  answer `a = ? OR b = ?` with one index per arm (`MULTI-INDEX OR` in the plan), but one
+  unindexed or non-matching arm turns the whole lookup into a scan. A header looked up by
+  any of four ids, once per queued change, read every header row per change: seconds per
+  refresh at ~2,000 headers. Split it into one branch per key and index each branch's
+  exact expression:
+
+  ```sql
+  SELECT h.id FROM [header] AS h WHERE trim(COALESCE(h.id, '')) = @key
+  UNION
+  SELECT h.id FROM [header] AS h WHERE trim(json_extract(h.data, '$.Nbr')) = @key
+  -- … one branch per key; UNION, not UNION ALL, when one row can match two keys
+  ```
+
+  Check the branches return the same rows as the `OR` on real data, including null and
+  empty keys. When the same multi-key lookup appears in several queries, build a small
+  key table (`header id, key`) during sync instead, so each lookup is one indexed
+  equality and the logic lives in one place.
+- **Materialise a CTE that must be computed once.** Since 3.35 a CTE referenced more than
+  once is materialised by default; one referenced once may be flattened into a correlated
+  part of the outer query and re-parse its JSON per row. `WITH keys AS MATERIALIZED (…)`
+  makes it explicit. It needs SQLite ≥ 3.35 on the device; check the plan shows
+  `MATERIALIZE keys`.
+- **One index per expression.** Two indexes on the same field with slightly different
+  wrapping (`json_extract(…)` and `trim(json_extract(…))`) both cost writes; usually only
+  one matches the queries. Drop the one no query uses.
+- **Guard the plans that matter in CI.** `scripts/check-plans.py` builds the shipped
+  indexes on stub tables and runs `EXPLAIN QUERY PLAN` on every datasource and
+  `execute-sql` read. A guard file fails the build when a per-row or per-change lookup
+  starts scanning, or stops using its index, after someone edits the query text:
+
+  ```json
+  {"changed-orders": {"no_scan": ["orders"], "uses": ["idx_orders_ref"]}}
+  ```
+
+- **Audit indexes no query uses.** The same report lists shipped indexes the planner
+  never picks. It runs on empty tables without `ANALYZE`, so treat the list as candidates:
+  confirm with `--schema-from` an exported database and the device's real query before
+  dropping one. Every unused index still costs every write.
 
 ## `action.execute-sql`
 
@@ -53,6 +92,10 @@ Prefer an index to a rewrite, and ship it so a failure cannot go unnoticed. `scr
 
 - **Keep new statements in a separate step** from proven ones, so a failure cannot drop indexes that
   already work.
+- **Keep table creation out of the index step.** A `CREATE TABLE` must name its real entity so
+  bound datasources refresh; an index step must not. Put each in its own action.
+- **Run index DDL once per schema change, not on every sign-in or user change.** It belongs after
+  the tables it indexes exist, outside the path the user waits on.
 - **DDL failure is silent.** When an index build called at the tail of a sync fails, the sync scope
   still reads `state='synced'`, `failed = 0`. The sync scope gates nothing that DDL does.
 - **Verify in `sqlite_master`, and nowhere else.** Indexes persist across publishes, so a non-empty

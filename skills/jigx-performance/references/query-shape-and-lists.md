@@ -34,6 +34,31 @@ row's position; the `!=` stops it appearing twice. Search still reaches every ro
   instead of clumping.
 - **When wrapping a `GROUP BY` for ordering, put the `ORDER BY` in the outer SELECT.** Ordering on a
   raw CTE column picks an arbitrary row per group.
+- **Shape data in SQL, not in expressions (DS-04).** SQL runs once per datasource change; JSONata
+  re-evaluates on every render that touches it, including list scrolls. Filter, count, sum, join,
+  sort and derive per-row columns in the query; expressions only decide what to show.
+- **Precompute heavy joins.** A read-path query with four or more joins over JSON columns is a
+  candidate for a view table built once with `execute-sql` during sync. Every bound parameter must
+  be a scalar; join-heavy queries also produced intermittent `row value misused` errors on device.
+- **Write `json_extract` in full, then set `rewriteQuery: false` (DS-03).** The rewriter turns the
+  `'$.field'` shorthand into `json_extract(data, '$.field')`. Verified on a device: with
+  `rewriteQuery: false`, `SELECT '$.name' AS name` returns the literal text `$.name`. Never set the
+  option on a query that still uses the shorthand anywhere, select list or `WHERE`: convert every
+  reference, set it, retest. The rewrite cost is paid on the first run and cached, so this is a
+  small gain; do it after the items that change how much work SQLite does.
+
+## List components
+
+- **A `jig.list` datasource returns a unique `id` (DS-02).** The `id` is the item's instance id;
+  without it the runtime hashes every row object on every render, and duplicates collide item state.
+- **`jig.list` for data-driven lists (CO-02).** `component.list` mounts every row at once;
+  `jig.list` virtualises. Use it for any datasource list that can exceed about ten rows. A
+  `maximumItemsToRender` cap hides rows; pair any cap with search.
+- **Never set `instanceId` on list items (CO-04).** The list manages it from the `id`.
+- **No custom components in list items (CO-01).** Each primitive in a custom component adds its own
+  renderer wrappers, multiplied per row; long lists of them fail to render, especially on Android.
+  Use built-in items and request a missing component.
+- **Prefer fixed-height items (CO-03).** `hasDynamicHeight` measures every item.
 
 ## Datasource reads in lists
 
