@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
-import {checkPerformance, filterPredicates, parseCreateIndex, normaliseExpr, loadSolution, markdownReport, where} from './check-performance.mjs';
+import {checkPerformance, filterPredicates, parseCreateIndex, normaliseExpr, loadSolution, markdownReport, sdkSources, where} from './check-performance.mjs';
 
 // Fixtures hold unreferenced global datasources; that check has its own test.
 const codes = (app, opts) => checkPerformance(app, opts).findings.map(x => x.code).filter(c => c !== 'unused-datasource').sort();
@@ -63,6 +63,7 @@ test('per-row datasource reads, != against a datasource field, and filters insid
   assert.deepEqual(codes({jigs: {a: {when: "=@ctx.datasources.queue.state != 'done'"}}}), ['datasource-not-equals']);
   assert.deepEqual(codes({jigs: {a: {expressions: {rows: '=$map(@ctx.datasources.forms, function($f) { @ctx.datasources.subs[formId = $f.id] })'}}}}), ['filter-inside-map']);
   assert.deepEqual(codes({jigs: {list: {item: {type: 'component.list-item', options: {title: '=@ctx.current.item.name'}}}}}), []);
+  assert.deepEqual(codes({jigs: {home: {children: [{type: 'component.list-item', options: {title: '=@ctx.datasources.sync.state'}}]}}}), []);
   assert.deepEqual(codes({jigs: {a: {data: '=$map(@ctx.datasources.files[id != null], function($v) { $v.id })'}}}), []);
 });
 
@@ -163,4 +164,14 @@ test('index steps: listed tables cannot be missing, one bound table is medium, s
   const ungated = run(step(['default/debug'], ['employees']));
   assert.deepEqual(ungated.map(f => f.code), ['ddl-ungated']);
   assert.match(ungated[0].message, /employees/);
+});
+
+test('maps SDK build entries to the TypeScript file that declares them', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jigx-sdk-'));
+  const write = (rel, text) => { fs.mkdirSync(path.dirname(path.join(dir, rel)), {recursive: true}); fs.writeFileSync(path.join(dir, rel), text); };
+  write('build/output.json', '{}');
+  write('src/jigs/Orders/list-orders.ts', "app.addScreen({ screenId: 'list-orders' })\nscreen.addDatasource.static({ datasourceId: 'local' })");
+  write('src/datasources/orders.ts', "app.addDatasource.sqlite({ datasourceId: 'orders' })");
+  assert.deepEqual(sdkSources(path.join(dir, 'build/output.json')),
+    {'$.jigs.list-orders': 'src/jigs/Orders/list-orders.ts', '$.datasources.orders': 'src/datasources/orders.ts'});
 });

@@ -203,7 +203,8 @@ export function checkPerformance(app, {stats = null, sources = {}} = {}) {
       const entity = typeof e === 'string' ? e : e?.entity;
       if (entity && !String(entity).startsWith('=')) syncs.push({path: `${path}.options.entities.${i}`, table: tableName(entity), entry: typeof e === 'object' ? e : {}});
     });
-    if (node.type === 'component.list-item') {
+    // Only a list's item: template renders per row; a list-item placed on its own renders once.
+    if (node.type === 'component.list-item' && /\.item$/.test(path)) {
       const reads = new Set();
       walk(node, value => {
         if (typeof value === 'string' && value.startsWith('=')) {
@@ -346,6 +347,29 @@ export function loadSolution(dir) {
   return {app, sources, parseErrors};
 }
 
+// For an SDK build, map each jig, datasource, action and function to the TypeScript file that
+// declares it (the first screenId/datasourceId/actionId/functionId in the file), so findings
+// point at src/... instead of the build.
+const SDK_KIND = {screenId: 'jigs', jigId: 'jigs', datasourceId: 'datasources', actionId: 'actions', functionId: 'functions'};
+export function sdkSources(outputFile) {
+  const project = path.dirname(path.dirname(path.resolve(outputFile)));
+  const src = path.join(project, 'src');
+  const sources = {};
+  if (!fs.existsSync(src)) return sources;
+  const visit = dir => {
+    for (const e of fs.readdirSync(dir, {withFileTypes: true})) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { if (e.name !== 'node_modules') visit(full); continue; }
+      if (!e.name.endsWith('.ts')) continue;
+      const m = /\b(screenId|jigId|datasourceId|actionId|functionId)\s*:\s*['"]([^'"]+)['"]/.exec(fs.readFileSync(full, 'utf8'));
+      const key = m && `$.${SDK_KIND[m[1]]}.${m[2]}`;
+      if (key && !sources[key]) sources[key] = path.relative(project, full);
+    }
+  };
+  visit(src);
+  return sources;
+}
+
 // Rows and bytes per table in an exported or simulator database (read-only).
 export async function tableStats(dbPath) {
   process.removeAllListeners('warning'); // node:sqlite prints an experimental warning on Node 22
@@ -403,7 +427,7 @@ async function main() {
     const dbPath = opt('--db'), reportPath = opt('--report');
     const file = args[0] || 'build/output.json';
     const loaded = fs.statSync(file).isDirectory()
-      ? loadSolution(file) : {app: JSON.parse(fs.readFileSync(file, 'utf8')), sources: {}, parseErrors: []};
+      ? loadSolution(file) : {app: JSON.parse(fs.readFileSync(file, 'utf8')), sources: sdkSources(file), parseErrors: []};
     if (dump) { process.stdout.write(JSON.stringify(loaded.app)); return; }
     const stats = dbPath ? await tableStats(dbPath) : null;
     const {findings, indexes} = checkPerformance(loaded.app, {stats, sources: loaded.sources});

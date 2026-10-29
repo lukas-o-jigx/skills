@@ -114,7 +114,9 @@ datasources.
 ## Audit a solution for performance
 
 Get a prioritized report of sync and performance problems in any Jigx solution: a YAML
-solution folder (the one with `index.jigx`) or an SDK build (`build/output.json`).
+solution folder (the one with `index.jigx`) or a TypeScript SDK project's build
+(`build/output.json`; build it first). For an SDK project, findings point at the
+`src/*.ts` file that declares the screen, datasource or action.
 
 In Claude Code, with the skills installed:
 
@@ -151,7 +153,8 @@ Findings are leads, not verdicts: confirm the ones you act on with
 `check-plans.py` (query plans), `profile-query.py` (timings on exported data) or a timed
 load (below). On the Field Services RC3 solution (618 files) the scan takes about 4
 seconds. It found 3 high, 76 medium and 442 low findings. The medium ones include two
-synced tables nothing reads and six unused global datasources.
+synced tables nothing reads and six unused global datasources. On the Expenses app rewritten to the SDK
+it found 1 high, 13 medium and 126 low, including five global datasources nothing uses.
 
 ## Review a customer solution for performance
 
