@@ -1,6 +1,6 @@
 ---
 name: jigx-performance
-description: Use when a Jigx screen, list or sync is slow, stalls or logs "Timeout for first snapshot", when auditing an existing solution for performance, when timing a load before and after a change, or when writing or changing a datasource.sqlite query, an action.execute-sql index, or a list whose items read datasources. Covers measuring on-device SQLite cost, live load tracking and before/after comparison, expression indexes and query-plan guards, shipping DDL safely, list query shape and components, state and expression cost, screen size, and verifying a change. Use together with the generic `jigx` skill.
+description: Use when a Jigx screen, list or sync is slow, stalls or logs "Timeout for first snapshot", when auditing an existing solution for sync and performance problems (a prioritized report of unread or oversized syncs, full pulls, unused datasources, slow queries and lists), when timing a load before and after a change, or when writing or changing a datasource.sqlite query, an action.execute-sql index, or a list whose items read datasources. Covers measuring on-device SQLite cost, live load tracking and before/after comparison, expression indexes and query-plan guards, shipping DDL safely, list query shape and components, state and expression cost, screen size, and verifying a change. Use together with the generic `jigx` skill.
 ---
 
 # Jigx Performance
@@ -11,8 +11,10 @@ screen stalls. Use this skill with the generic `jigx` skill, and with `jigx-acum
 when the data comes from Acumatica (its reads and sync contract decides how much data
 reaches the device at all).
 
-This skill covers the read path. The sync and write path is out of scope except where
-an index adds to write cost.
+This skill covers the read path and how much the sync brings onto the device: tables
+nothing reads, full pulls, unselected fields, payload size and sync timing. Sync order,
+delta design and writes live in the `jigx` skill (`sync-orchestration.md`,
+`writes-and-duplicates.md`).
 
 ## Pick the mode
 
@@ -27,8 +29,9 @@ the request:
   "make this customer's app faster".
 
 - **Audit an existing solution**: the user reports a slow screen, or wants findings
-  without the full review. Follow "Audit" below. Default the solution path to the current
-  project and its `build/output.json`; build first if that file is missing.
+  without the full review, or a prioritized list of sync and performance problems.
+  Follow "Audit" below. Default the solution path to the current project: its folder
+  when it has `index.jigx`, else its `build/output.json` (build first if missing).
 - **Build or change a solution**: a new or changed `datasource.sqlite`,
   `action.execute-sql`, or list. Follow "Build" below.
 - **Measure a change**: the user wants before/after times or to watch a load. Follow
@@ -52,19 +55,24 @@ Follow `references/customer-review.md`:
 
 ## Audit
 
-1. Build the solution and run the static scan on the generated output:
+1. Run the static scan on the solution: a YAML folder (with `index.jigx`) or an SDK
+   `build/output.json`. Pass the device database when one exists (`track-load.py
+   --list`), so sync findings are sized by real rows and bytes:
 
    ```sh
-   node <skill-directory>/scripts/check-performance.mjs build/output.json
+   node <skill-directory>/scripts/check-performance.mjs <solution> --db <device.db> --report audit.md > audit.json
    ```
 
-   It reports per-row datasource reads in list items, uncapped search lists, filter
-   predicates that no shipped index matches, `execute-sql` shape and DDL risks, and
-   JSONata comparison traps. Every finding is a lead to measure, not a verdict. Then
-   list full scans and unused indexes from the query planner:
+   Every finding has a priority (high, medium, low), a section, where it is (file, then
+   the path inside it), what is wrong and the recommended fix. `audit.md` groups them
+   by priority and type. It covers sync (tables nothing reads, full pulls, missing
+   `$select`, large tables), unused global datasources, per-row datasource reads,
+   uncapped searches, unindexed and wrapped filters, `execute-sql` DDL risks and JSONata
+   traps. Every finding is a lead to measure, not a verdict. Then list full scans and
+   unused indexes from the query planner:
 
    ```sh
-   python3 <skill-directory>/scripts/check-plans.py build/output.json --scans-only
+   python3 <skill-directory>/scripts/check-plans.py <solution> --scans-only
    ```
 2. Read `references/measuring.md`. Get row **and byte** counts for the tables behind
    the slow screen on a real device, then export those tables.
@@ -76,8 +84,10 @@ Follow `references/customer-review.md`:
 
    It prints the SQLite version, row and byte counts per table, the query plan and
    median timings. Attribute cost per CTE and per predicate before proposing a fix.
-4. Group findings by section (A–H in `references/recipe-index.md`) and review the
-   sections the scripts cannot see (state, expressions, screen size, start-up).
+4. Check each high and medium finding in the source before reporting it, and drop the
+   false ones (e.g. a table read only by a script). Review the sections the scripts
+   cannot see (state, expressions, screen size, start-up). Give the user `audit.md`,
+   high priority first, with the findings you confirmed and the ones you dropped.
 5. Fix the largest measured cost first, one section and one change at a time, using
    the references below. Prefer an index to a rewrite.
 6. Verify per `references/verifying.md`, time it per `references/run-and-track.md`, and
@@ -129,8 +139,10 @@ Follow `references/customer-review.md`:
 
 ## Scripts
 
-- `scripts/check-performance.mjs` - dependency-free static scan of `build/output.json`.
-  Exits nonzero only on errors; most findings are warnings to investigate.
+- `scripts/check-performance.mjs` - dependency-free static scan of a YAML solution
+  folder or `build/output.json`, with priorities, fixes and an optional Markdown report
+  (`--report`) and device sizing (`--db`). Exits nonzero only on errors; most findings
+  are warnings to investigate.
 - `scripts/profile-query.py` - standard-library profiler for an exported SQLite
   database: counts, bytes, plan, timings, optional synthetic scale-up on a copy.
 - `scripts/check-plans.py` - query plans for every datasource and `execute-sql` read

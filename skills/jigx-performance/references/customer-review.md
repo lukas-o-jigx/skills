@@ -25,8 +25,8 @@ Work on a branch in the customer repo. Commit nothing until the user approves ch
 
 ```sh
 mkdir -p perf-review/before
-node <skill-directory>/scripts/check-performance.mjs build/output.json > perf-review/before/static.json
-python3 <skill-directory>/scripts/check-plans.py build/output.json > perf-review/before/plans.json
+node <skill-directory>/scripts/check-performance.mjs <solution> --report perf-review/before/audit.md > perf-review/before/static.json
+python3 <skill-directory>/scripts/check-plans.py <solution> > perf-review/before/plans.json
 ```
 
 Publish the current build to the test solution (`jigx_debug` `create_debug_session`) and
@@ -71,8 +71,8 @@ fails.
 
 ```sh
 mkdir -p perf-review/after
-node <skill-directory>/scripts/check-performance.mjs build/output.json > perf-review/after/static.json
-python3 <skill-directory>/scripts/check-plans.py build/output.json > perf-review/after/plans.json
+node <skill-directory>/scripts/check-performance.mjs <solution> --report perf-review/after/audit.md > perf-review/after/static.json
+python3 <skill-directory>/scripts/check-plans.py <solution> > perf-review/after/plans.json
 ```
 
 Publish to the same test solution, record `post-1..3` with the same journey, data and

@@ -3,6 +3,8 @@
 // No network or writes. Findings are leads to measure, not verdicts: confirm each with
 // row/byte counts and a query plan before changing anything (references/measuring.md).
 import fs from 'node:fs';
+import path from 'node:path';
+import {spawnSync} from 'node:child_process';
 import {pathToFileURL} from 'node:url';
 
 function walk(value, visit, path = '$') {
@@ -116,18 +118,89 @@ export function filterPredicates(query) {
   return [...preds.entries()].map(([norm, p]) => ({norm, ...p}));
 }
 
+// The function argument of each $map(array, function) call; the array argument runs once.
+function mapBodies(expr) {
+  const out = [];
+  for (const m of expr.matchAll(/\$map\s*\(/g)) {
+    let depth = 0;
+    for (let i = m.index + m[0].length; i < expr.length; i++) {
+      const c = expr[i];
+      if ('([{'.includes(c)) depth++;
+      else if (')]}'.includes(c)) { if (depth-- === 0) break; }
+      else if (c === ',' && depth === 0) { out.push(expr.slice(i + 1)); break; }
+    }
+  }
+  return out;
+}
+
 const asArray = v => Array.isArray(v) ? v : v === undefined || v === null ? [] : [v];
 const statementText = s => typeof s === 'string' ? s : (s?.statement ?? s?.sql ?? '');
+const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const tableName = entity => String(entity).replace(/^default\//, '').toLowerCase();
+const MB = 1024 * 1024;
+const size = st => `${st.rows} rows, ${(st.bytes / MB).toFixed(1)} MB`;
 
-export function checkPerformance(app) {
+// Priority, section (A-H in references/recipe-index.md) and recommended fix for each finding.
+export const RULES = {
+  'execute-sql-entities': {priority: 'high', section: 'B', fix: 'Add entities: with a table nothing binds to, e.g. [default/debug].'},
+  'ddl-ungated': {priority: 'high', section: 'B', fix: 'Gate each CREATE INDEX on its table existing (read sqlite_master into a datasource), or keep a real entity for tables that may not exist yet (references/indexes-and-execute-sql.md).'},
+  'ddl-invalidates-datasources': {priority: 'high', section: 'B', fix: 'List a table nothing binds to (default/debug) in entities:, after gating every statement on its table existing.'},
+  'filter-inside-map': {priority: 'high', section: 'D', fix: 'Key the view into a map once ($merge of $map) and look up by id inside the loop.'},
+  'per-row-datasource-read': {priority: 'medium', section: 'C', fix: 'Resolve the datasource once in expressions: or the list data:, and read @ctx.current.item.* in the item.'},
+  'uncapped-search-list': {priority: 'medium', section: 'C', fix: 'Add a LIMIT (e.g. 200) and union a pinned arm for the current selection.'},
+  'unindexed-predicate': {priority: 'low', section: 'B', fix: 'If the table can grow, ship an expression index with exactly this text, then confirm with check-plans.py.'},
+  'wrapped-predicate': {priority: 'low', section: 'B', fix: 'Filter on one indexable json_extract expression (store a normalised key if needed) and index it.'},
+  'index-not-idempotent': {priority: 'medium', section: 'B', fix: 'Use CREATE INDEX IF NOT EXISTS.'},
+  'datasource-not-equals': {priority: 'low', section: 'D', fix: "Use $count(ds[field='X']) = 0 so the no-row case passes."},
+  'unused-datasource': {priority: 'medium', section: 'E', fix: 'Delete it, or move it into the one screen that needs it. A global datasource re-runs whenever its tables change.'},
+  'synced-table-unread': {priority: 'medium', section: 'F', fix: 'Stop syncing it, or sync it on demand where it is used. First check scripts and functions that may read it.'},
+  'sync-full-pull': {priority: 'low', section: 'F', fix: 'Pull by modified date (filter on the newest local value) and merge; keep full pulls for small reference tables (jigx references/sync-orchestration.md).'},
+  'sync-no-select': {priority: 'low', section: 'F', fix: 'Add $select with only the fields the app reads, so each sync downloads and stores less.'},
+  'large-synced-table': {priority: 'medium', section: 'F', fix: 'Pull less: filter to the user (branch, assignee, date window), select fewer fields, or sync the table on demand.'},
+};
+export const PRIORITIES = ['high', 'medium', 'low'];
+const DELTA = /modif|lastmod|last_mod|since|delta|changed|updated/i;
+const FILTERED = /filter|where|query|\$top/i;
+
+// Readable location: the source file (YAML folder) or the solution section, then the path inside it.
+const KINDS = ['jigs', 'datasources', 'actions', 'functions', 'components', 'databases'];
+export function where(path, sources = {}) {
+  const m = /^\$\.([\w-]+)\.([^.]+)(.*)$/.exec(path);
+  if (!m || !KINDS.includes(m[1])) return `index › ${path.replace(/^\$\.?/, '')}`;
+  const file = sources[`$.${m[1]}.${m[2]}`] ?? `${m[1]}/${m[2]}`;
+  const rest = m[3].replace(/^\./, '');
+  return rest ? `${file} › ${rest}` : file;
+}
+
+// stats: optional {table: {rows, bytes}} from a device database (tableStats), to size sync findings.
+export function checkPerformance(app, {stats = null, sources = {}} = {}) {
   const findings = [];
-  const add = (code, path, message, severity = 'warning') => findings.push({severity, code, path, message});
+  const add = (code, path, message, {severity = 'warning', priority} = {}) => findings.push({
+    severity, priority: priority ?? RULES[code].priority, section: RULES[code].section, code, path,
+    where: where(path, sources), message, fix: RULES[code].fix});
 
-  const datasources = [], ddlActions = [], indexes = [];
+  const datasources = [], ddlActions = [], indexes = [], syncs = [];
+  const refs = new Map(), readTables = new Set();
+  let sqlText = '';
   walk(app, (node, path) => {
+    if (typeof node === 'string') {
+      for (const r of node.matchAll(/@ctx\.datasources\.([\w-]+)/g)) refs.set(r[1], [...(refs.get(r[1]) ?? []), path]);
+      return;
+    }
     if (!node || typeof node !== 'object') return;
+    if (typeof node.type === 'string' && node.type.startsWith('datasource.')) {
+      for (const e of asArray(node.options?.entities)) readTables.add(tableName(typeof e === 'string' ? e : e?.entity));
+      if (typeof node.options?.query === 'string') sqlText += '\n' + node.options.query;
+    }
     if (node.type === 'datasource.sqlite' && typeof node.options?.query === 'string') datasources.push({path, node});
-    if (node.type === 'action.execute-sql') ddlActions.push({path, node});
+    if (node.type === 'action.execute-sql') {
+      ddlActions.push({path, node});
+      sqlText += '\n' + asArray(node.options?.statements ?? node.statements).map(statementText).join('\n');
+    }
+    if (node.type === 'action.sync-entities') asArray(node.options?.entities).forEach((e, i) => {
+      const entity = typeof e === 'string' ? e : e?.entity;
+      if (entity && !String(entity).startsWith('=')) syncs.push({path: `${path}.options.entities.${i}`, table: tableName(entity), entry: typeof e === 'object' ? e : {}});
+    });
     if (node.type === 'component.list-item') {
       const reads = new Set();
       walk(node, value => {
@@ -136,19 +209,16 @@ export function checkPerformance(app) {
         }
       });
       if (reads.size) add('per-row-datasource-read', path,
-        `List item reads ${[...reads].join(', ')} per rendered row (one live subscription each). Resolve once in expressions:, feed data:, and read @ctx.current.item.*.`);
+        `List item reads ${[...reads].join(', ')} per rendered row (one live subscription each).`);
       return;
     }
-    if (typeof node === 'object') {
-      for (const [key, value] of Object.entries(node)) {
-        if (typeof value !== 'string' || !value.startsWith('=')) continue;
-        const expr = withoutJsonataStrings(value);
-        if (/@ctx\.datasources\.[\w-]+(?:\.[\w-]+)+\s*!=/.test(expr))
-          add('datasource-not-equals', `${path}.${key}`, "Comparison against an undefined field is false, so `ds.field != 'X'` blocks the no-row case. Use $count(ds[field='X']) = 0.");
-        const map = expr.indexOf('$map(');
-        if (map >= 0 && /@ctx\.datasources\.[\w-]+\s*\[/.test(expr.slice(map)))
-          add('filter-inside-map', `${path}.${key}`, 'A datasource filter inside $map walks the view once per element (O(n²)). Key the view into a map once with $merge/$map and look up by id.');
-      }
+    for (const [key, value] of Object.entries(node)) {
+      if (typeof value !== 'string' || !value.startsWith('=')) continue;
+      const expr = withoutJsonataStrings(value);
+      if (/@ctx\.datasources\.[\w-]+(?:\.[\w-]+)+\s*!=/.test(expr))
+        add('datasource-not-equals', `${path}.${key}`, "Comparison against an undefined field is false, so `ds.field != 'X'` blocks the no-row case.");
+      if (mapBodies(expr).some(body => /@ctx\.datasources\.[\w-]+\s*\[/.test(body)))
+        add('filter-inside-map', `${path}.${key}`, 'A datasource filter inside $map walks the view once per element (O(n²)).');
     }
   });
 
@@ -159,46 +229,189 @@ export function checkPerformance(app) {
     const opts = node.options ?? node;
     const entities = asArray(opts.entities ?? node.entities);
     const statements = asArray(opts.statements ?? node.statements).map(statementText);
-    if (!entities.length) add('execute-sql-entities', path, 'action.execute-sql needs a non-empty entities: array; without it the action fails on shape before any statement runs.', 'error');
+    if (!entities.length) add('execute-sql-entities', path, 'action.execute-sql has no entities: array, so the action fails on shape before any statement runs.', {severity: 'error'});
     const created = statements.map(parseCreateIndex).filter(Boolean);
     if (!created.length) continue;
     indexes.push(...created.map(c => ({...c, path})));
     const real = entities.map(e => typeof e === 'string' ? e : e?.entity).filter(e => boundEntities.has(e));
     if (real.length) add('ddl-invalidates-datasources', path,
-      `Index DDL lists ${real.join(', ')} in entities:, which re-runs every datasource bound to them (~6.6 s measured on device). Use a table nothing binds to, e.g. default/debug.`);
-    if (created.some(c => !c.ifNotExists)) add('index-not-idempotent', path, 'Use CREATE INDEX IF NOT EXISTS (or DROP INDEX IF EXISTS + CREATE in the same step) so re-runs do not fail the step.');
+      `Index DDL lists ${real.join(', ')} in entities:, which re-runs every datasource bound to them (~6.6 s measured on device).`);
+    if (created.some(c => !c.ifNotExists)) add('index-not-idempotent', path, 'CREATE INDEX without IF NOT EXISTS fails the step on a re-run.');
     if (node.when === undefined && opts.when === undefined) add('ddl-ungated', path,
-      'Gate CREATE INDEX on the table existing (read sqlite_master into a datasource). One "no such table" on a fresh install rolls back every statement in the step.');
+      'CREATE INDEX is not gated on its table existing. One "no such table" on a fresh install rolls back every statement in the step.');
   }
 
   const indexed = new Set(indexes.flatMap(i => i.expressions));
   for (const {path, node} of datasources) {
     const query = node.options.query;
+    // An index matters once a table can grow: low unless the device data shows 1000+ rows.
+    const rows = Math.max(0, ...asArray(node.options.entities).map(e => stats?.[tableName(typeof e === 'string' ? e : e?.entity)]?.rows ?? 0));
+    const sized = rows >= 1000 ? {priority: 'medium'} : {};
     const masked = maskSql(query);
     if (/\bLIKE\b/i.test(masked) && /'%'\s*\|\|/.test(stripComments(query)) && !/\bLIMIT\b/i.test(masked))
-      add('uncapped-search-list', `${path}.options.query`, "Contains-search (LIKE '%' || …) with no LIMIT scans, sorts and renders every row. Cap it and union a pinned arm for the current selection.");
+      add('uncapped-search-list', `${path}.options.query`, "Contains-search (LIKE '%' || …) with no LIMIT scans, sorts and renders every row.");
     for (const p of filterPredicates(query)) {
       if (p.like) continue; // a leading-wildcard LIKE cannot use an index anyway
       if (p.multiArm && p.wrapped) {
-        add('wrapped-predicate', `${path}.options.query`, `${p.expr} wraps several json_extract arms in functions, so no index on either arm can be used. Filter on one indexable expression.`);
+        add('wrapped-predicate', `${path}.options.query`, `${p.expr} wraps several json_extract arms in functions, so no index on either arm can be used.`, sized);
         continue;
       }
-      if (!indexed.has(p.norm)) add('unindexed-predicate', `${path}.options.query`,
-        `No shipped CREATE INDEX matches ${p.expr}. If this table can grow, add an expression index with exactly this text.`);
+      if (!indexed.has(p.norm)) add('unindexed-predicate', `${path}.options.query`, `No shipped CREATE INDEX matches ${p.expr}${rows ? ` (${rows} rows)` : ''}.`, sized);
     }
   }
+
+  // Unnecessary loads: global datasources nothing reads.
+  for (const name of Object.keys(app.datasources ?? {})) {
+    const own = `$.datasources.${name}`;
+    if (!(refs.get(name) ?? []).some(p => p !== own && !p.startsWith(own + '.')))
+      add('unused-datasource', own, `Global datasource ${name} is not referenced by any screen, expression or action.`);
+  }
+
+  // Sync: tables nothing reads, full pulls, unselected fields and payload size.
+  const sql = sqlText.toLowerCase();
+  const isRead = t => readTables.has(t) || new RegExp(`(^|[^\\w-])${escapeRe(t)}([^\\w-]|$)`).test(sql);
+  const seen = new Set();
+  const entryText = s => {
+    const fn = app.functions?.[s.entry.function] ?? {};
+    return {fn, own: JSON.stringify(s.entry.parameters ?? s.entry.functionParameters ?? {}),
+      all: JSON.stringify([s.entry.parameters ?? s.entry.functionParameters ?? {}, fn.parameters ?? {}, fn.url ?? '', fn.inputTransform ?? ''])};
+  };
+  const deltaTables = new Set(syncs.filter(s => s.entry.function && DELTA.test(entryText(s).all)).map(s => s.table));
+  for (const s of syncs) {
+    const st = stats?.[s.table];
+    const once = code => !seen.has(`${code}:${s.table}`) && seen.add(`${code}:${s.table}`);
+    if (!isRead(s.table) && once('unread'))
+      add('synced-table-unread', s.path, `${s.table} is synced${st ? ` (${size(st)})` : ''} but no datasource or SQL reads it.`);
+    if (st && (st.bytes >= 5 * MB || st.rows >= 5000) && once('large'))
+      add('large-synced-table', s.path, `${s.table} holds ${size(st)} on the device.`,
+        {priority: st.bytes >= 20 * MB || st.rows >= 20000 ? 'high' : 'medium'});
+    const fnName = s.entry.function;
+    if (!fnName) continue;
+    const {fn, own} = entryText(s);
+    const params = fn.parameters ?? {};
+    // A targeted or windowed pull (a filter in the call) is not a full pull; nor is a table another step pulls by delta.
+    const required = Object.entries(params).some(([k, v]) => FILTERED.test(k) && v?.required);
+    if (!deltaTables.has(s.table) && !FILTERED.test(Object.keys(JSON.parse(own)).join(' ')) && !required && once('full'))
+      add('sync-full-pull', s.path, `${s.table} is pulled in full by ${fnName} on every run; no modified-date filter found${st ? ` (${size(st)})` : ''}.`,
+        {priority: !st ? 'low' : st.rows >= 1000 ? 'high' : st.rows >= 200 ? 'medium' : 'low'});
+    const odata = Object.keys(params).some(k => k.startsWith('$')) || /\$(filter|expand|top)=/i.test(fn.url ?? '');
+    if ((fn.method ?? 'GET').toUpperCase() === 'GET' && odata && !('$select' in params) && !/\$select=/i.test(fn.url ?? '') && once('select'))
+      add('sync-no-select', s.path, `${fnName} fetches every field of ${s.table}${st?.rows ? ` (${Math.round(st.bytes / st.rows)} bytes a row)` : ''}.`,
+        {priority: st?.rows && st.bytes / st.rows >= 2048 ? 'medium' : 'low'});
+  }
+
+  findings.sort((a, b) => PRIORITIES.indexOf(a.priority) - PRIORITIES.indexOf(b.priority));
   return {findings, indexes: indexes.map(({name, table, path}) => ({name, table, path}))};
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// A YAML solution folder as one object shaped like build/output.json, plus each entry's source file.
+// Ruby's built-in YAML parser keeps this script dependency-free (macOS ships Ruby).
+const RUBY = 'require "yaml"; require "json"; require "date"; d = ARGV[0]; out = {}; ' +
+  'STDIN.read.split("\\n").each { |f| begin; out[f] = YAML.safe_load(File.read(File.join(d, f)), permitted_classes: [Date, Time], aliases: true); ' +
+  'rescue => e; out[f] = {"__parseError" => e.message}; end }; puts JSON.generate(out)';
+export function loadSolution(dir) {
+  const files = [];
+  const visit = rel => {
+    for (const e of fs.readdirSync(path.join(dir, rel), {withFileTypes: true})) {
+      if (/^[._]/.test(e.name) || e.name === 'node_modules' || e.name === 'build') continue;
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) visit(r); else if (e.name.endsWith('.jigx')) files.push(r);
+    }
+  };
+  visit('');
+  if (!files.includes('index.jigx')) throw new Error(`${dir} has no index.jigx; give a YAML solution folder or build/output.json`);
+  const run = spawnSync('ruby', ['-e', RUBY, dir], {input: files.join('\n'), encoding: 'utf8', maxBuffer: 1 << 30});
+  if (run.error || run.status !== 0) throw new Error(`could not parse the YAML with Ruby: ${run.error?.message ?? run.stderr.trim()}`);
+  const docs = JSON.parse(run.stdout);
+  const app = {}, sources = {}, parseErrors = [];
+  for (const rel of files) {
+    const doc = docs[rel];
+    if (doc?.__parseError) { parseErrors.push({file: rel, error: doc.__parseError}); continue; }
+    const kind = rel.split('/')[0];
+    if (rel === 'index.jigx') Object.assign(app, doc);
+    else if (KINDS.includes(kind) && rel.includes('/')) {
+      const name = path.basename(rel, '.jigx');
+      (app[kind] ??= {})[name] = doc;
+      sources[`$.${kind}.${name}`] = rel;
+    }
+  }
+  return {app, sources, parseErrors};
+}
+
+// Rows and bytes per table in an exported or simulator database (read-only).
+export async function tableStats(dbPath) {
+  process.removeAllListeners('warning'); // node:sqlite prints an experimental warning on Node 22
+  const {DatabaseSync} = await import('node:sqlite');
+  const db = new DatabaseSync(dbPath, {readOnly: true});
+  const out = {};
+  for (const {name} of db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all()) {
+    const q = `"${name.replace(/"/g, '""')}"`;
+    try { out[tableName(name)] = db.prepare(`SELECT count(*) AS rows, coalesce(sum(length(data)), 0) AS bytes FROM ${q}`).get(); }
+    catch { out[tableName(name)] = {rows: db.prepare(`SELECT count(*) AS rows FROM ${q}`).get().rows, bytes: 0}; }
+  }
+  db.close();
+  return out;
+}
+
+const SECTIONS = {A: 'Measure and track', B: 'Queries and indexes', C: 'Lists and rendering', D: 'State and expressions',
+  E: 'Screens and start-up', F: 'Sync', G: 'Writes and duplicates', H: 'Security and logs'};
+
+export function markdownReport({title, findings, parseErrors = [], stats}) {
+  const count = p => findings.filter(f => f.priority === p).length;
+  const lines = [`# Performance audit: ${title}`, '',
+    `**${count('high')} high · ${count('medium')} medium · ${count('low')} low**`, '',
+    'Each finding is a lead from a static scan: confirm it on the device before changing anything',
+    '(row and byte counts, a query plan, a timed load). Fix high first, one section at a time.', ''];
+  if (parseErrors.length) lines.push(`Not scanned (YAML errors): ${parseErrors.map(e => e.file).join(', ')}`, '');
+  for (const p of PRIORITIES) {
+    const items = findings.filter(f => f.priority === p);
+    if (!items.length) continue;
+    lines.push(`## ${p[0].toUpperCase()}${p.slice(1)} priority`, '');
+    for (const code of [...new Set(items.map(f => f.code))]) {
+      const group = items.filter(f => f.code === code);
+      lines.push(`### ${code} (${group.length}) · ${group[0].section} ${SECTIONS[group[0].section]}`, '',
+        `**Fix:** ${group[0].fix}`, '');
+      for (const message of [...new Set(group.map(f => f.message))]) {
+        const at = group.filter(f => f.message === message).map(f => `\`${f.where}\``);
+        lines.push(at.length === 1 ? `- ${at[0]}: ${message}` : `- ${message} ${at.length} places: ${at.slice(0, 3).join(', ')}${at.length > 3 ? ', …' : ''}`);
+      }
+      lines.push('');
+    }
+  }
+  if (stats) {
+    const top = Object.entries(stats).filter(([, s]) => s.rows).sort((a, b) => b[1].bytes - a[1].bytes).slice(0, 10);
+    lines.push('## Largest tables on the device', '', '| Table | Rows | MB |', '| --- | ---: | ---: |',
+      ...top.map(([t, s]) => `| ${t} | ${s.rows} | ${(s.bytes / MB).toFixed(2)} |`), '');
+  }
+  if (!findings.length) lines.push('No findings.', '');
+  return lines.join('\n');
+}
+
+async function main() {
   try {
-    const file = process.argv[2] || 'build/output.json';
-    const {findings, indexes} = checkPerformance(JSON.parse(fs.readFileSync(file, 'utf8')));
+    const args = process.argv.slice(2);
+    const opt = name => { const i = args.indexOf(name); return i >= 0 ? args.splice(i, 2)[1] : undefined; };
+    const dump = args.includes('--dump-app') && args.splice(args.indexOf('--dump-app'), 1);
+    const dbPath = opt('--db'), reportPath = opt('--report');
+    const file = args[0] || 'build/output.json';
+    const loaded = fs.statSync(file).isDirectory()
+      ? loadSolution(file) : {app: JSON.parse(fs.readFileSync(file, 'utf8')), sources: {}, parseErrors: []};
+    if (dump) { process.stdout.write(JSON.stringify(loaded.app)); return; }
+    const stats = dbPath ? await tableStats(dbPath) : null;
+    const {findings, indexes} = checkPerformance(loaded.app, {stats, sources: loaded.sources});
     const count = s => findings.filter(x => x.severity === s).length;
-    const byCode = {};
-    for (const f of findings) byCode[f.code] = (byCode[f.code] ?? 0) + 1;
-    console.log(JSON.stringify({file, errors: count('error'), warnings: count('warning'), byCode, indexesFound: indexes, findings,
+    const byCode = {}, byPriority = {high: 0, medium: 0, low: 0};
+    for (const f of findings) { byCode[f.code] = (byCode[f.code] ?? 0) + 1; byPriority[f.priority]++; }
+    console.log(JSON.stringify({file, errors: count('error'), warnings: count('warning'), byPriority, byCode,
+      parseErrors: loaded.parseErrors, indexesFound: indexes, findings,
       limits: 'Static leads only. Confirm each with row/byte counts and a query plan (scripts/profile-query.py); this does not measure device timing.'}, null, 2));
+    if (reportPath) {
+      const title = loaded.app.title ?? loaded.app.name ?? path.basename(path.resolve(file));
+      fs.writeFileSync(reportPath, markdownReport({title, findings, parseErrors: loaded.parseErrors, stats}));
+      console.error(`Report written to ${reportPath}: ${byPriority.high} high, ${byPriority.medium} medium, ${byPriority.low} low.`);
+    }
     process.exitCode = findings.some(x => x.severity === 'error') ? 1 : 0;
   } catch (error) { console.error(`Performance check failed: ${error.message}`); process.exitCode = 2; }
 }
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();

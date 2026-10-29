@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Check which indexes the SQLite planner picks for every query in a Jigx solution.
 
-Standard library only. Reads build/output.json, builds an in-memory database with a
+Standard library only. Reads build/output.json or a YAML solution folder (loaded
+through check-performance.mjs, which needs Node and Ruby), builds an in-memory database with a
 stub `(id, data, timestamp)` table for every table the SQL names (or the real
 schema, with --schema-from an exported device database), applies every shipped
 CREATE INDEX, and runs EXPLAIN QUERY PLAN on each `datasource.sqlite` query and
@@ -23,12 +24,15 @@ SQLite; check the device's version line. Read references/indexes-and-execute-sql
 
 Examples:
   python3 check-plans.py build/output.json
+  python3 check-plans.py path/to/yaml-solution --scans-only
   python3 check-plans.py build/output.json --schema-from device.db --guard perf-guard.json
 """
 import argparse
 import json
+import os
 import re
 import sqlite3
+import subprocess
 import sys
 
 MASK = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|--[^\n]*|/\*.*?\*/", re.S)
@@ -206,8 +210,15 @@ def main(argv=None):
     p.add_argument("--guard", help="JSON file of per-query rules; failures exit 1")
     p.add_argument("--scans-only", action="store_true", help="list only queries with full scans")
     args = p.parse_args(argv)
-    with open(args.output, encoding="utf-8") as f:
-        app = json.load(f)
+    if os.path.isdir(args.output):
+        scanner = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-performance.mjs")
+        run = subprocess.run(["node", scanner, args.output, "--dump-app"], capture_output=True, text=True)
+        if run.returncode:
+            p.error(run.stderr.strip() or "could not load the solution folder")
+        app = json.loads(run.stdout)
+    else:
+        with open(args.output, encoding="utf-8") as f:
+            app = json.load(f)
     guard = None
     if args.guard:
         with open(args.guard, encoding="utf-8") as f:

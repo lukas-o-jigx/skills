@@ -52,7 +52,11 @@ def read(folder, *parts):
 def findings(static, plans):
     """{section: {label: count}} from the static scan and the plan check."""
     out = {}
-    if static:
+    if static and static.get("findings") is not None:
+        for f in static["findings"]:
+            section = out.setdefault(f.get("section") or CODE_SECTION.get(f["code"], "B"), {})
+            section[f["code"]] = section.get(f["code"], 0) + 1
+    elif static:
         for code, n in (static.get("byCode") or {}).items():
             out.setdefault(CODE_SECTION.get(code, "B"), {})[code] = n
     if plans:
@@ -108,6 +112,12 @@ def report(folder, solution=None):
     lines = [f"# {title}", ""]
     lines += ["## Load time", ""] + timing_lines(comparison) + [""]
     lines += ["## Findings by section", ""]
+    pri = (read(folder, "before", "static.json") or {}).get("byPriority")
+    if pri:
+        after_pri = (after_static or {}).get("byPriority")
+        lines += [f"Priority before: {pri['high']} high, {pri['medium']} medium, {pri['low']} low"
+                  + (f"; after: {after_pri['high']} high, {after_pri['medium']} medium, {after_pri['low']} low" if after_pri else "")
+                  + ". The full list with locations and fixes is in `audit.md` (`check-performance.mjs --report`).", ""]
     if after is None:
         lines += ["Baseline only; nothing has been changed yet.", "",
                   "| § | Section | Finding | Count |", "| --- | --- | --- | ---: |"]

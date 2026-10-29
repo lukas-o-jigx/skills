@@ -104,12 +104,54 @@ REST/OData functions, `acuerp` tokens, `acumaticaURL` casing, lookup expands,
 local-first sync, command queue retry, file upload, PDF attachment, and service order
 submission patterns.
 
-Run it as `/jigx-performance audit [solution path]`, `/jigx-performance build` or
+Run it as `/jigx-performance review [solution path]`, `/jigx-performance audit [solution path]`, `/jigx-performance build` or
 `/jigx-performance measure [test solution]` in Claude Code, or let it load on its own:
 use `jigx-performance` with `jigx` when a screen or sync is slow or logs
 `Timeout for first snapshot`, when auditing a solution, or when writing a
 `datasource.sqlite` query, an `action.execute-sql` index, or a list whose items read
 datasources.
+
+## Audit a solution for performance
+
+Get a prioritized report of sync and performance problems in any Jigx solution: a YAML
+solution folder (the one with `index.jigx`) or an SDK build (`build/output.json`).
+
+In Claude Code, with the skills installed:
+
+```text
+/jigx-performance audit path/to/solution
+```
+
+Or run the scan yourself, with no install. It needs Node 18+ (22.5+ for `--db`) and,
+for YAML folders, Ruby, whose built-in YAML parser it uses (macOS ships Ruby):
+
+```sh
+node skills/jigx-performance/scripts/check-performance.mjs path/to/solution \
+  --report audit.md > audit.json
+```
+
+Add `--db <device database>` to size the sync findings with real row and byte counts
+(`python3 skills/jigx-performance/scripts/track-load.py --list` finds the simulator
+databases). Without it, size-dependent findings stay at low priority.
+
+`audit.md` lists every finding under **High**, **Medium** or **Low**, grouped by type.
+Each type shows its recommended fix once, and each finding shows where it is (the file,
+then the path inside it) and what is wrong. `audit.json` holds the same data for tools.
+It checks:
+
+| Area | What it finds | Priority |
+| --- | --- | --- |
+| Sync | tables synced that nothing reads; full pulls with no modified-date filter; OData pulls without `$select`; tables over 5 MB or 5,000 rows on the device | medium; full pulls and missing `$select` low unless `--db` shows big tables |
+| Unnecessary loads | global datasources nothing references | medium |
+| Indexes | index DDL that re-runs every bound datasource or rolls back on a fresh install; filters no shipped index matches | high; unmatched filters low unless the table has 1,000+ rows |
+| Lists and screens | datasource reads per list row; contains-searches with no `LIMIT` | medium |
+| Expressions | datasource filters inside `$map` (O(n²)); `!=` against a datasource field | high; low |
+
+Findings are leads, not verdicts: confirm the ones you act on with
+`check-plans.py` (query plans), `profile-query.py` (timings on exported data) or a timed
+load (below). On the Field Services RC3 solution (618 files) the scan takes about 4
+seconds. It found 4 high, 76 medium and 442 low findings. The medium ones include two
+synced tables nothing reads and six unused global datasources.
 
 ## Review a customer solution for performance
 
@@ -174,18 +216,18 @@ Scan the generated application for performance leads, then profile the slow quer
 against an exported device database:
 
 ```sh
-node skills/jigx-performance/scripts/check-performance.mjs /path/to/solution/build/output.json
+node skills/jigx-performance/scripts/check-performance.mjs /path/to/solution --report audit.md
 python3 skills/jigx-performance/scripts/profile-query.py device.db query.sql --scale 10 --ddl index.sql
-python3 skills/jigx-performance/scripts/check-plans.py /path/to/solution/build/output.json --scans-only
+python3 skills/jigx-performance/scripts/check-plans.py /path/to/solution --scans-only
 node --test skills/jigx-performance/scripts/check-performance.test.mjs
 python3 -m unittest skills/jigx-performance/scripts/test_profile_query.py
 python3 -m unittest skills/jigx-performance/scripts/test_load_tools.py
 python3 skills/jigx-performance/scripts/review-report.py perf-review --solution <name>
 ```
 
-The scan flags per-row datasource reads in list items, uncapped search lists,
-filter predicates no shipped index matches, `execute-sql` shape and DDL risks, and
-JSONata comparison traps. Its findings are leads to measure, not verdicts. The
+Both scripts take a YAML solution folder or a `build/output.json`. The scan's checks
+and priorities are listed under "Audit a solution for performance" above. Its findings
+are leads to measure, not verdicts. The
 profiler works on a copy, reports row and byte counts, the query plan and timings
 at 1x and scaled data, before and after DDL, and can diff a rewrite against the
 original. Host timings show relative cost; they are not device timings. The plan
