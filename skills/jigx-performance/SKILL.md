@@ -74,6 +74,10 @@ Follow `references/customer-review.md`:
    ```sh
    python3 <skill-directory>/scripts/check-plans.py <solution> --scans-only
    ```
+
+   Before a PR into main, audit main first and pass it as `--baseline main.json
+   --fail-on high`: the scan then lists what the branch adds and exits 1 on a new high
+   finding. `USAGE.md` has the steps and a CI job.
 2. Read `references/measuring.md`. Get row **and byte** counts for the tables behind
    the slow screen on a real device, then export those tables.
 3. Profile the slow query on the host at 1x and 10x:
@@ -141,7 +145,7 @@ Follow `references/customer-review.md`:
 
 - `scripts/check-performance.mjs` - dependency-free static scan of a YAML solution
   folder or `build/output.json`, with priorities, fixes and an optional Markdown report
-  (`--report`) and device sizing (`--db`). Exits nonzero only on errors; most findings
+  (`--report`), device sizing (`--db`), and a pre-PR gate (`--baseline`, `--fail-on`). Exits nonzero only on errors; most findings
   are warnings to investigate.
 - `scripts/profile-query.py` - standard-library profiler for an exported SQLite
   database: counts, bytes, plan, timings, optional synthetic scale-up on a copy.

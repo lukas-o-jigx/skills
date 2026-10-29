@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
-import {checkPerformance, filterPredicates, parseCreateIndex, normaliseExpr, loadSolution, markdownReport, sdkSources, where} from './check-performance.mjs';
+import {checkPerformance, filterPredicates, parseCreateIndex, normaliseExpr, loadSolution, markdownReport, newFindings, sdkSources, where} from './check-performance.mjs';
 
 // Fixtures hold unreferenced global datasources; that check has its own test.
 const codes = (app, opts) => checkPerformance(app, opts).findings.map(x => x.code).filter(c => c !== 'unused-datasource').sort();
@@ -174,4 +174,26 @@ test('maps SDK build entries to the TypeScript file that declares them', () => {
   write('src/datasources/orders.ts', "app.addDatasource.sqlite({ datasourceId: 'orders' })");
   assert.deepEqual(sdkSources(path.join(dir, 'build/output.json')),
     {'$.jigs.list-orders': 'src/jigs/Orders/list-orders.ts', '$.datasources.orders': 'src/datasources/orders.ts'});
+});
+
+test('baseline: only findings missing from the earlier audit are new, moves are not', () => {
+  const f = (code, where, message, priority = 'high') => ({code, where, message, priority});
+  const base = [f('a', 'jigs/x.jigx › children.1', 'm'), f('b', 'jigs/y.jigx › item', 'n')];
+  const now = [f('a', 'jigs/x.jigx › children.4', 'm'), f('a', 'jigs/x.jigx › children.5', 'm'), f('c', 'jigs/z.jigx › item', 'o')];
+  assert.deepEqual(newFindings(now, base).map(x => x.where), ['jigs/x.jigx › children.5', 'jigs/z.jigx › item']);
+});
+
+test('--fail-on gates the exit code, against the baseline when one is given', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jigx-gate-'));
+  const app = {jigs: {a: {children: [{type: 'component.list', options: {item: {type: 'component.list-item', options: {t: '=@ctx.datasources.x.y'}}}}]}}};
+  fs.writeFileSync(path.join(dir, 'output.json'), JSON.stringify(app));
+  const script = path.join(import.meta.dirname, 'check-performance.mjs');
+  const run = (...args) => spawnSync(process.execPath, [script, path.join(dir, 'output.json'), ...args], {encoding: 'utf8'});
+  assert.equal(run('--fail-on', 'high').status, 0);
+  const failed = run('--fail-on', 'medium');
+  assert.equal(failed.status, 1);
+  assert.match(failed.stderr, /\[medium\] per-row-datasource-read/);
+  fs.writeFileSync(path.join(dir, 'base.json'), failed.stdout);
+  assert.equal(run('--fail-on', 'medium', '--baseline', path.join(dir, 'base.json')).status, 0);
+  assert.equal(run('--fail-on', 'nope').status, 2);
 });

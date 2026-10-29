@@ -118,6 +118,16 @@ solution folder (the one with `index.jigx`) or a TypeScript SDK project's build
 (`build/output.json`; build it first). For an SDK project, findings point at the
 `src/*.ts` file that declares the screen, datasource or action.
 
+Run it before every PR into a solution's main branch, compared with main, so a branch
+cannot add high-priority problems unnoticed. The step-by-step guide, how to read the
+report, findings you can accept and a CI job are in
+[`skills/jigx-performance/USAGE.md`](skills/jigx-performance/USAGE.md):
+
+```sh
+node skills/jigx-performance/scripts/check-performance.mjs path/to/solution \
+  --baseline main-audit.json --fail-on high --report audit.md > audit.json
+```
+
 In Claude Code, with the skills installed:
 
 ```text

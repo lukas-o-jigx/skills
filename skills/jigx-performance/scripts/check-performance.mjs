@@ -419,12 +419,23 @@ export function markdownReport({title, findings, parseErrors = [], stats}) {
   return lines.join('\n');
 }
 
+// Findings on this branch that the baseline (an earlier audit.json, e.g. from main) does not
+// have. Matched by code, file and message, not the path inside the file, so moving a block
+// does not count as new. Repeats are counted, so a second copy of a known finding is new.
+export function newFindings(findings, baseline) {
+  const key = f => `${f.code}|${(f.where ?? f.path).split(' › ')[0]}|${f.message}`;
+  const seen = new Map();
+  for (const f of baseline) seen.set(key(f), (seen.get(key(f)) ?? 0) + 1);
+  return findings.filter(f => { const n = seen.get(key(f)) ?? 0; seen.set(key(f), n - 1); return n <= 0; });
+}
+
 async function main() {
   try {
     const args = process.argv.slice(2);
     const opt = name => { const i = args.indexOf(name); return i >= 0 ? args.splice(i, 2)[1] : undefined; };
     const dump = args.includes('--dump-app') && args.splice(args.indexOf('--dump-app'), 1);
-    const dbPath = opt('--db'), reportPath = opt('--report');
+    const dbPath = opt('--db'), reportPath = opt('--report'), baselinePath = opt('--baseline'), failOn = opt('--fail-on');
+    if (failOn && !PRIORITIES.includes(failOn)) throw new Error(`--fail-on takes ${PRIORITIES.join(', ')}`);
     const file = args[0] || 'build/output.json';
     const loaded = fs.statSync(file).isDirectory()
       ? loadSolution(file) : {app: JSON.parse(fs.readFileSync(file, 'utf8')), sources: sdkSources(file), parseErrors: []};
@@ -434,15 +445,20 @@ async function main() {
     const count = s => findings.filter(x => x.severity === s).length;
     const byCode = {}, byPriority = {high: 0, medium: 0, low: 0};
     for (const f of findings) { byCode[f.code] = (byCode[f.code] ?? 0) + 1; byPriority[f.priority]++; }
+    const added = baselinePath ? newFindings(findings, JSON.parse(fs.readFileSync(baselinePath, 'utf8')).findings ?? []) : null;
+    const gated = failOn ? (added ?? findings).filter(x => PRIORITIES.indexOf(x.priority) <= PRIORITIES.indexOf(failOn)) : [];
     console.log(JSON.stringify({file, errors: count('error'), warnings: count('warning'), byPriority, byCode,
-      parseErrors: loaded.parseErrors, indexesFound: indexes, findings,
+      parseErrors: loaded.parseErrors, indexesFound: indexes, findings, ...(added && {newFindings: added}),
       limits: 'Static leads only. Confirm each with row/byte counts and a query plan (scripts/profile-query.py); this does not measure device timing.'}, null, 2));
     if (reportPath) {
       const title = loaded.app.title ?? loaded.app.name ?? path.basename(path.resolve(file));
       fs.writeFileSync(reportPath, markdownReport({title, findings, parseErrors: loaded.parseErrors, stats}));
       console.error(`Report written to ${reportPath}: ${byPriority.high} high, ${byPriority.medium} medium, ${byPriority.low} low.`);
     }
-    process.exitCode = findings.some(x => x.severity === 'error') ? 1 : 0;
+    if (added) console.error(`${added.length} finding(s) not in the baseline.`);
+    for (const f of gated) console.error(`[${f.priority}] ${f.code} ${f.where}: ${f.message}`);
+    if (gated.length) console.error(`${gated.length} ${added ? 'new ' : ''}finding(s) at ${failOn} priority or above.`);
+    process.exitCode = gated.length || findings.some(x => x.severity === 'error') ? 1 : 0;
   } catch (error) { console.error(`Performance check failed: ${error.message}`); process.exitCode = 2; }
 }
 
