@@ -188,6 +188,8 @@ export function checkPerformance(app, {stats = null, sources = {}} = {}) {
       return;
     }
     if (!node || typeof node !== 'object') return;
+    // SDK builds copy a global datasource into each jig that uses it, tagged with its datasourceId.
+    if (typeof node.datasourceId === 'string') refs.set(node.datasourceId, [...(refs.get(node.datasourceId) ?? []), path]);
     if (typeof node.type === 'string' && node.type.startsWith('datasource.')) {
       for (const e of asArray(node.options?.entities)) readTables.add(tableName(typeof e === 'string' ? e : e?.entity));
       if (typeof node.options?.query === 'string') sqlText += '\n' + node.options.query;

@@ -84,6 +84,9 @@ test('unused global datasources; a reference from anywhere but itself counts', (
     jigs: {home: {title: '=@ctx.datasources.used.name'}}};
   const unused = checkPerformance(app).findings.filter(f => f.code === 'unused-datasource').map(f => f.path).sort();
   assert.deepEqual(unused, ['$.datasources.self', '$.datasources.unused']);
+  const sdk = {datasources: {orders: {...ds('SELECT 1'), datasourceId: 'orders'}},
+    jigs: {home: {datasources: {orders: {...ds('SELECT 1'), datasourceId: 'orders'}}}}};
+  assert.deepEqual(checkPerformance(sdk).findings.filter(f => f.code === 'unused-datasource'), []);
 });
 
 test('sync: unread tables, full pulls, missing $select, sized by device stats', () => {
