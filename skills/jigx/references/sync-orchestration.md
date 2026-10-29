@@ -42,6 +42,33 @@ when: =$count(@ctx.datasources.sync-status[state='failed']) = 0
 Use feature flags from configuration to include or skip feature groups, so a customer who
 does not use a feature does not download it.
 
+## Run independent groups in parallel
+
+Two sequential groups whose steps take 0.5–1 s each mostly wait on round trips. When one
+group reads nothing the other writes, run them side by side: an `action.action-list` with
+`isSequential: false` around the two groups, each group still sequential inside. Measured on a
+simulator: first sync 39 s to 32 s on the same data. Before doing it:
+
+- **Trace dependencies through every called action.** Grep each group's file *and every
+  action it calls*, recursively, for `@ctx.datasources.*`. A reference-data group called an
+  equipment refresh that filtered by the appointments' customers; in parallel it ran before
+  the appointments existed, fetched nothing, and the run looked 10 s faster with 89 rows
+  missing. Move such steps after the join.
+- **Start every sync scope before either group.** `action.start-sync-scope` registers the
+  steps a scope tracks. If it runs inside one group, the other group's first step can start
+  before its scope exists, is never marked synced, and the scope stays `syncing` for good.
+  Put the scope starts in their own action and run it first.
+- **One logout after the join.** An integration that ends its API session at the end of
+  each group would have the faster group log out under the slower one. Skip the per-group
+  logout when orchestrated (an action parameter) and log out once after both.
+- **Keep the old path working.** Screens that call one group on its own (a manual resync)
+  should still start their scope and log out as before; gate the skipped steps on the
+  parameter, not by deleting them.
+- **Check the server's limit.** Two groups mean two concurrent requests per user; confirm
+  the backend allows it before going wider.
+- **Compare row counts for every table** before and after (`run-and-track.md` in
+  `jigx-performance`), not only the tables you watch.
+
 ## Delta, not full pulls
 
 Pull mutable entities by modified date, keyed on the newest value stored locally:
@@ -127,6 +154,8 @@ filters, for when delta state is corrupted. Keep it behind a confirmation.
 
 - [ ] Context gate before any sync; clear message when it fails.
 - [ ] Essential, background and on-demand tiers; feature groups isolated.
+- [ ] Independent groups in parallel, dependencies traced through called actions, scopes
+      started before either group, one logout after the join.
 - [ ] Every step gated on no earlier failure and on `isOnline`.
 - [ ] Delta by modified date for every mutable entity; bounded first window for heavy ones.
 - [ ] Interval refresh on focus from a stored last-run time, no timers.
