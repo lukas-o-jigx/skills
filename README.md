@@ -143,14 +143,14 @@ It checks:
 | --- | --- | --- |
 | Sync | tables synced that nothing reads; full pulls with no modified-date filter; OData pulls without `$select`; tables over 5 MB or 5,000 rows on the device | medium; full pulls and missing `$select` low unless `--db` shows big tables |
 | Unnecessary loads | global datasources nothing references | medium |
-| Indexes | index DDL that re-runs every bound datasource or rolls back on a fresh install; filters no shipped index matches | high; unmatched filters low unless the table has 1,000+ rows |
+| Indexes | index DDL that re-runs every bound datasource or rolls back on a fresh install; filters no shipped index matches | high (medium for a one-table step); unmatched filters low unless the table has 1,000+ rows |
 | Lists and screens | datasource reads per list row; contains-searches with no `LIMIT` | medium |
 | Expressions | datasource filters inside `$map` (O(n²)); `!=` against a datasource field | high; low |
 
 Findings are leads, not verdicts: confirm the ones you act on with
 `check-plans.py` (query plans), `profile-query.py` (timings on exported data) or a timed
 load (below). On the Field Services RC3 solution (618 files) the scan takes about 4
-seconds. It found 4 high, 76 medium and 442 low findings. The medium ones include two
+seconds. It found 3 high, 76 medium and 442 low findings. The medium ones include two
 synced tables nothing reads and six unused global datasources.
 
 ## Review a customer solution for performance

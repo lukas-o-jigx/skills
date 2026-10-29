@@ -233,12 +233,18 @@ export function checkPerformance(app, {stats = null, sources = {}} = {}) {
     const created = statements.map(parseCreateIndex).filter(Boolean);
     if (!created.length) continue;
     indexes.push(...created.map(c => ({...c, path})));
-    const real = entities.map(e => typeof e === 'string' ? e : e?.entity).filter(e => boundEntities.has(e));
+    const names = entities.map(e => typeof e === 'string' ? e : e?.entity);
+    const real = names.filter(e => boundEntities.has(e));
+    // One table per step is the documented trade-off (the entity also creates a missing table): medium.
     if (real.length) add('ddl-invalidates-datasources', path,
-      `Index DDL lists ${real.join(', ')} in entities:, which re-runs every datasource bound to them (~6.6 s measured on device).`);
+      `Index DDL lists ${real.join(', ')} in entities:, which re-runs every datasource bound to them (~6.6 s measured on device).`,
+      {priority: real.length === 1 ? 'medium' : 'high'});
     if (created.some(c => !c.ifNotExists)) add('index-not-idempotent', path, 'CREATE INDEX without IF NOT EXISTS fails the step on a re-run.');
-    if (node.when === undefined && opts.when === undefined) add('ddl-ungated', path,
-      'CREATE INDEX is not gated on its table existing. One "no such table" on a fresh install rolls back every statement in the step.');
+    // A table listed in entities: is created if missing, so only unlisted tables can fail.
+    const listed = new Set(names.filter(Boolean).map(tableName));
+    const unlisted = [...new Set(created.map(c => tableName(c.table)))].filter(t => !listed.has(t));
+    if (node.when === undefined && opts.when === undefined && unlisted.length) add('ddl-ungated', path,
+      `CREATE INDEX on ${unlisted.join(', ')} is not gated on the table existing, nor listed in entities:. One "no such table" on a fresh install rolls back every statement in the step.`);
   }
 
   const indexed = new Set(indexes.flatMap(i => i.expressions));

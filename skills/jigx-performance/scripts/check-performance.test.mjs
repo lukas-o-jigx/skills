@@ -149,3 +149,15 @@ test('targeted pulls, tables pulled by delta elsewhere and expression entity lis
   };
   assert.deepEqual(codes(app).filter(c => c !== 'sync-no-select'), []);
 });
+
+test('index steps: listed tables cannot be missing, one bound table is medium, several are high', () => {
+  const step = (entities, tables, extra = {}) => ({type: 'action.execute-sql', ...extra, options: {entities,
+    statements: tables.map(t => `CREATE INDEX IF NOT EXISTS idx_${t} ON ${t} (json_extract(data, '$.LastModifiedDateTime'))`)}});
+  const datasources = {a: ds('SELECT 1', ['employees']), b: ds('SELECT 1', ['vendor'])};
+  const run = action => checkPerformance({datasources, actions: {i: action}}).findings.filter(f => f.code.startsWith('ddl-'));
+  assert.deepEqual(run(step(['employees'], ['employees'])).map(f => [f.code, f.priority]), [['ddl-invalidates-datasources', 'medium']]);
+  assert.deepEqual(run(step(['employees', 'vendor'], ['employees', 'vendor'])).map(f => [f.code, f.priority]), [['ddl-invalidates-datasources', 'high']]);
+  const ungated = run(step(['default/debug'], ['employees']));
+  assert.deepEqual(ungated.map(f => f.code), ['ddl-ungated']);
+  assert.match(ungated[0].message, /employees/);
+});
