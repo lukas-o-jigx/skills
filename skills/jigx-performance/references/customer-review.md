@@ -9,9 +9,12 @@ solution project.
 
 Confirm with the user, once:
 
-- the solution folder and that it builds (`build/output.json`)
-- the **test** solution to publish to, and the app to run it in. Never publish to or
-  time against production or a working user's phone
+- the solution folder and that it builds (`build/output.json`; a YAML solution has
+  none: work on a copy renamed to the test solution and publish it with Jigx Builder,
+  as in `run-and-track.md`)
+- the **test** solution to publish to, its organisation, and the app to run it in
+  (branded apps need `targetAppName`). Never publish to or time against production or a
+  working user's phone
 - the journey to time: fresh sign-in and initial sync, a refresh, or opening a screen
 - realistic test data: a load that is fast because the test user has ten rows proves
   nothing
@@ -54,6 +57,8 @@ user agrees. Approval for one section does not cover another.
 For each approved section, in order:
 
 - make the changes with the section's reference, one commit per section
+- for a sync change, trace what each step reads through every action it calls before
+  reordering or parallelising it (`jigx` `sync-orchestration.md`)
 - keep every index or rewrite equivalence-checked (`verifying.md`)
 - add a `check-plans.py` guard for each per-row or per-change lookup you fixed
 - append each change to `perf-review/changes.json` as
@@ -78,8 +83,10 @@ python3 <skill-directory>/scripts/compare-runs.py perf-review/runs --before pre 
 python3 <skill-directory>/scripts/review-report.py perf-review --solution <name>
 ```
 
-Check final row counts match between pre and post runs; a faster load that fetched
-less is a regression.
+Compare the row count of every table with a copy of the database taken after a pre
+run, not only the watched tables; a faster load that fetched less is a regression. A
+change that reorders or parallelises steps needs this most: it can run a step before the
+data it filters by exists.
 
 ## 5. Report
 

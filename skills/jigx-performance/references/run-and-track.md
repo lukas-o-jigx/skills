@@ -22,23 +22,42 @@ not a timeline.
 
 ## Run
 
-1. **Publish to a test solution only.** Use `jigx_debug` `create_debug_session` with the
-   test solution's path and target app; never time against production or a working
+1. **Publish to a test solution only.** Never time against production or a working
    user's phone. Same simulator, fixture data, network and build settings for every run.
-2. **Find the database.** `python3 track-load.py --list` lists solution databases in the
-   local simulators, newest first.
-3. **Arm, then start the load.** Arm before logging in, refreshing or opening the screen:
+   - SDK solutions: `jigx_debug` `create_debug_session` with `publish: true`.
+   - YAML solutions: `create_debug_session` cannot build them. Copy the solution, set the
+     copy's `index.jigx` `name:` and `title:` to the test solution, and publish the copy
+     with Jigx Builder in VS Code. The customer checkout stays untouched.
+   - Builder publishes to the organisation in `.vscode/settings.json`
+     (`jigx.workspace.organizationId`); point `jigx_debug` at the same one
+     (`select_debug_organization`), or it reports the solution as not found.
+   - A branded app needs `targetAppName` (the branded app's name); without it the link opens the
+     standard app.
+2. **Get a simulator you can see.** In Xcode 27 the simulator window is DeviceHub
+   (`Xcode.app/Contents/Applications/DeviceHub.app`); Simulator.app is gone. A branded
+   app's simulator build installs with `xcrun simctl install <udid> <path>.app`. Time on
+   the simulator, not a phone: the phone debug connection can stall after sign-in and
+   never answer queries.
+3. **Arm, then start the load.** Arm before signing in, refreshing or opening the screen:
 
    ```sh
-   python3 <skill-directory>/scripts/track-load.py --solution <test-solution> \
+   python3 <skill-directory>/scripts/track-load.py --solution <test-solution> --wait \
      --label pre-1 --scopes <scope-a>,<scope-b> --table <main-table>
    ```
 
-   Name the scopes that define "ready" (the essential tier); without `--scopes` every
-   scope started after arming counts. It prints a line per change, stops when every
-   tracked scope is synced and `_commandQueue` is empty for `--settle` seconds (or on a
-   failed entry, or `--timeout`), then prints a waterfall of entries and writes
-   `perf-runs/<label>-summary.json` and `-samples.jsonl`.
+   - `--wait` waits for the database to appear: on a first sign-in it does not exist yet,
+     and a logout may delete it (or keep it; both happened in one session).
+   - **Always name `--scopes` for a sign-in or refresh journey.** Without it every scope
+     started after arming counts, so a periodic background sync (an appointment-changes
+     pull every few minutes) ends the run early with a one-second "ready".
+   - It prints a line per change, stops when every tracked scope is synced and
+     `_commandQueue` is empty for `--settle` seconds (or on a failed entry, or
+     `--timeout`), then prints a waterfall and writes `perf-runs/<label>-summary.json`
+     and `-samples.jsonl`.
+   - Time from the first scope start, not from arming: the wait before it includes the
+     user typing credentials.
+   - After the first baseline run, copy the database for the data check below:
+     `sqlite3 "file:<db>?mode=ro" ".backup 'baseline.db'"`.
 4. **Three runs per side.** `pre-1..3` on the old build, `post-1..3` on the new one, each
    from the same starting state (fresh login, or the same refresh).
 5. **Compare.**
@@ -48,9 +67,11 @@ not a timeline.
    ```
 
    It reports medians for first start to ready, each scope and each entry, flags any
-   slowdown over 10% (a review threshold, not an SLA), and warns on fewer than three runs
-   a side, runs that did not reach ready, or runs from different machines. It writes
-   `comparison.md` for the PR.
+   slowdown over 10% and 0.5 s (a review threshold, not an SLA; smaller steps are one or
+   two samples of noise), and warns on fewer than three runs a side, runs that did not
+   reach ready, or runs from different machines. It writes `comparison.md` for the PR.
+   Leave a cold first run (solution download, first sign-in) out of the medians, or
+   report it separately.
 
 ## Reading the result
 
@@ -61,8 +82,10 @@ not a timeline.
   points at a needless dependency (`sync-orchestration.md` in the `jigx` skill).
 - **A faster total with new `Timeout for first snapshot` lines or errors is not an
   improvement.** Compare the log signals as well as the times.
-- **Check the data, not only the time.** Equal final row counts before and after; a load
-  that is fast because it fetched less is a regression.
+- **Check the data, not only the time.** Compare the row count of every table with the
+  baseline copy, not only the `--table`s you watched; a load that is fast because it
+  fetched less is a regression. One parallel-sync change looked 10 s faster with two
+  reference tables empty; only the full comparison caught it.
 
 ## Rules
 

@@ -77,6 +77,12 @@ Prefer an index to a rewrite, and ship it so a failure cannot go unnoticed. `scr
   them and re-runs it (~6.6 s measured on device). An index changes no data, so use a table nothing
   binds to: `entities: [default/debug]`. This holds only while that table stays unbound: point any
   datasource at it and the trick silently becomes the ~6.6 s invalidation it exists to avoid.
+- **Listing a real table in `entities:` also creates it when it is missing.** An existing index step
+  that names its tables may depend on that: swap the list for a throwaway entity and the first
+  `CREATE INDEX` on a table the user has no rows for fails with `no such table`, and every later
+  statement in the step with it (measured: 11 of 55 indexes created, an error modal at the end of
+  the initial sync). Before swapping, gate every statement on its table existing (below), or keep
+  the real entity for tables that may not exist yet.
 - **Gate each `CREATE INDEX` on the table existing.** DYNAMIC (`default/*`) tables are created on
   first write. A step is one transaction, so one `no such table` on a fresh install takes every other
   index in that step down with it and raises error modals during the initial sync. Read

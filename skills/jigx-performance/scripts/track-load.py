@@ -27,6 +27,7 @@ references/run-and-track.md.
 Examples:
   python3 track-load.py --list
   python3 track-load.py --solution my-solution-test --label pre-1 --table orders
+  python3 track-load.py --solution my-solution-test --wait --scopes sync-base,sync-lookups --label pre-2
   python3 track-load.py --db path/to/jigx.solution.___x___.<uuid>.db --scopes sync-base,sync-lookups
 """
 import argparse
@@ -290,7 +291,10 @@ def main(argv=None):
                    help="run label; prefix with pre-/post- for compare-runs.py")
     p.add_argument("--out", default="perf-runs")
     p.add_argument("--table", action="append", default=[], help="table to count each sample; repeatable")
-    p.add_argument("--scopes", default="", help="comma-separated sync scope ids that define ready; default: every scope started after arming")
+    p.add_argument("--scopes", default="", help="comma-separated sync scope ids that define ready; default: every scope "
+                   "started after arming. Name them for a login journey, or a periodic background sync ends the run early")
+    p.add_argument("--wait", action="store_true",
+                   help="with --solution: wait for the database to appear (first sign-in, or a logout that removed it)")
     p.add_argument("--interval", type=float, default=0.25)
     p.add_argument("--settle", type=float, default=5.0, help="seconds ready must hold before stopping")
     p.add_argument("--timeout", type=float, default=900.0)
@@ -302,8 +306,14 @@ def main(argv=None):
     db = args.db
     if not db and args.solution:
         found = solution_dbs(args.solution)
+        if not found and args.wait:
+            print(f"Waiting for a database for '{args.solution}'. Sign in now.", flush=True)
+            deadline = time.time() + args.timeout
+            while not found and time.time() < deadline:
+                time.sleep(0.5)
+                found = solution_dbs(args.solution)
         if not found:
-            p.error(f"no simulator database for solution '{args.solution}'; run --list")
+            p.error(f"no simulator database for solution '{args.solution}'; run --list, or pass --wait")
         db = found[0]
     if not db:
         p.error("give --db or --solution (see --list)")

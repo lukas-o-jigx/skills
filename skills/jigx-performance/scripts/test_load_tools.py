@@ -135,6 +135,11 @@ class CompareRunsTest(unittest.TestCase):
         self.assertEqual(report["warnings"], [])
         self.assertIn("| total: first start to ready | 22 | 11 | -50.0% | improved |", cr.markdown(report))
 
+    def test_change_below_sampling_resolution_is_same(self):
+        self.assertEqual(cr.change(0.52, 0.78, 10), (50.0, "same"))
+        self.assertEqual(cr.change(0.52, 1.29, 10), (148.1, "REGRESSION"))
+        self.assertEqual(cr.change(0.52, 0.78, 10, min_change=0.1), (50.0, "REGRESSION"))
+
     def test_warns_on_few_runs_mixed_machines_and_unready_runs(self):
         report = cr.compare([run("pre-1", 20, 5)], [run("post-1", None, 5, machine="n", result="timeout")])
         text = " ".join(report["warnings"])

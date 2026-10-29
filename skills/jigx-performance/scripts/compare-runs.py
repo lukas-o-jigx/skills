@@ -5,7 +5,9 @@ Standard library only. Reads <folder>/*-summary.json, groups runs by label prefi
 (default pre- and post-), and reports medians for the time from first scope start
 to ready, each scope, and each sync entry, with the change in percent. A slowdown
 over --threshold percent (default 10) is flagged for investigation; it is a review
-threshold, not an SLA.
+threshold, not an SLA. A change smaller than --min-change seconds (default 0.5, two
+samples at track-load.py's 0.25 s interval) is reported as "same": entry times are
+only as precise as the sampling, so a one-sample step is not a regression.
 
 Writes <folder>/comparison.md and comparison.json, and prints the markdown.
 Exits 1 when the total time regressed past the threshold or any run did not reach
@@ -35,12 +37,14 @@ def median(values):
     return round(statistics.median(values), 2) if values else None
 
 
-def change(before, after, threshold):
+def change(before, after, threshold, min_change=0.5):
     if before is None or after is None:
         return None, "missing"
     if before == 0:
         return None, "same" if after == 0 else "new"
     pct = round((after - before) / before * 100, 1)
+    if abs(after - before) < min_change:
+        return pct, "same"
     return pct, "REGRESSION" if pct > threshold else "improved" if pct < -threshold else "same"
 
 
@@ -54,12 +58,12 @@ def metrics(runs):
     return out
 
 
-def compare(before, after, threshold=10.0):
+def compare(before, after, threshold=10.0, min_change=0.5):
     b, a = metrics(before), metrics(after)
     rows = []
     for name in list(dict.fromkeys(list(b) + list(a))):
         mb, ma = median(b.get(name, [])), median(a.get(name, []))
-        pct, verdict = change(mb, ma, threshold)
+        pct, verdict = change(mb, ma, threshold, min_change)
         rows.append({"metric": name, "before_s": mb, "after_s": ma, "change_pct": pct, "verdict": verdict})
     warnings = []
     for side, runs in (("before", before), ("after", after)):
@@ -74,7 +78,7 @@ def compare(before, after, threshold=10.0):
     timeouts = {side: sum(sum(r.get("snapshot_timeouts", {}).values()) for r in runs)
                 for side, runs in (("before", before), ("after", after))}
     errors = {side: sum(r.get("log_errors", 0) for r in runs) for side, runs in (("before", before), ("after", after))}
-    return {"threshold_pct": threshold, "before_runs": [r["label"] for r in before],
+    return {"threshold_pct": threshold, "min_change_s": min_change, "before_runs": [r["label"] for r in before],
             "after_runs": [r["label"] for r in after], "rows": rows, "warnings": warnings,
             "snapshot_timeouts": timeouts, "log_errors": errors,
             "machine": sorted(m or "?" for m in machines)}
@@ -89,7 +93,8 @@ def markdown(report):
              f"Before: {', '.join(report['before_runs']) or 'none'}  ",
              f"After: {', '.join(report['after_runs']) or 'none'}  ",
              f"Machine: {'; '.join(report['machine'])}  ",
-             f"Medians in seconds; slowdowns over {report['threshold_pct']}% are flagged.", ""]
+             f"Medians in seconds; slowdowns over {report['threshold_pct']}% and "
+             f"{report.get('min_change_s', 0.5)} s are flagged.", ""]
     if report["warnings"]:
         lines += ["**Warnings**", ""] + [f"- {w}" for w in report["warnings"]] + [""]
     lines += ["| Metric | Before | After | Change | Verdict |", "| --- | ---: | ---: | ---: | --- |"]
@@ -109,11 +114,13 @@ def main(argv=None):
     p.add_argument("--before", default="pre")
     p.add_argument("--after", default="post")
     p.add_argument("--threshold", type=float, default=10.0, help="percent slowdown to flag")
+    p.add_argument("--min-change", type=float, default=0.5,
+                   help="seconds; smaller changes are reported as same (sampling resolution)")
     args = p.parse_args(argv)
     before, after = load(args.folder, args.before), load(args.folder, args.after)
     if not before or not after:
         p.error(f"need {args.before}*-summary.json and {args.after}*-summary.json in {args.folder}")
-    report = compare(before, after, args.threshold)
+    report = compare(before, after, args.threshold, args.min_change)
     md = markdown(report)
     with open(os.path.join(args.folder, "comparison.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
