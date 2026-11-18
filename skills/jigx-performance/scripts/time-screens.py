@@ -53,9 +53,11 @@ round. Ids beat texts for navigation: a pushed screen's back button is `<jig-id>
 (list screens: `navigation-bar-extended.back-button.icon`), a tab is
 `tab-bar.<uuid>-<name>`, and a tab's text starts with its icon glyph, so match it with
 `.*Home`, not `Home`. `--ids` prints the ids and texts on the screen now (from `maestro
-hierarchy`, without layout noise); given the spec it runs the prepare steps first, `--at
+hierarchy`, without layout noise); given the spec it runs the prepare and reset steps first, `--at
 <screen>` also follows that screen's setup and tap, and `--tap <text|id:ID>` taps on the way, so
-one call lists the ids of the screen you want to time. Never use the More tab or the solution switcher as a
+one call lists the ids of the screen you want to time. After listing, `--at` runs that screen's
+`after` steps, so the app is back where the next call starts (a pushed screen hides the tab bar);
+when a step on the way fails, the failing step is printed. Never use the More tab or the solution switcher as a
 control screen: one wrong tap switches solution.
 
 Maestro's first iOS run builds and installs its driver (a minute or two), so an untimed
@@ -83,6 +85,7 @@ is run with that one (JAVA_HOME for its process only; the shell profile is not c
 """
 import argparse
 import datetime
+import glob
 import json
 import os
 import platform as platform_mod
@@ -210,6 +213,9 @@ def path_flow(app_id, spec=None, platform="ios", at=None, taps=()):
     lines = [f"appId: {app_id}", "---", "- launchApp:", "    stopApp: false"]
     for st in steps((spec or {}).get("prepare"), platform):
         lines += step_yaml(st, platform)
+    if at:  # start where a timed run starts: the spec's reset steps bring the app to its start screen
+        for st in steps((spec or {}).get("reset"), platform):
+            lines += step_yaml(st, platform)
     if at:
         screen = next((x for x in (spec or {}).get("screens", []) if x["name"] == at), None)
         if screen is None:
@@ -222,6 +228,23 @@ def path_flow(app_id, spec=None, platform="ios", at=None, taps=()):
         lines += tap_yaml(tap_target(t))[0]
     lines += ["- waitForAnimationToEnd:", f"    timeout: {SETTLE_MS}"]
     return "\n".join(lines) + "\n"
+
+
+def after_flow(app_id, screen, platform="ios"):
+    """The screen's `after` steps as one flow, without launching: back to where the next call starts."""
+    lines = [f"appId: {app_id}", "---"]
+    for st in steps(screen.get("after"), platform):
+        lines += step_yaml(st, platform)
+    return "\n".join(lines) + "\n"
+
+
+def maestro_failure(text, code=None):
+    """The step Maestro failed on, from its output: the line that names it, else the last lines."""
+    failed = re.findall(r"[^\n]*(?:\.\.\. FAILED|Assertion is false|Element not found|not found within)[^\n]*", text or "")
+    if failed:
+        return re.sub(r"\s+", " ", failed[0]).strip()[:300]
+    tail = [l.strip() for l in (text or "").splitlines() if l.strip()][-3:]
+    return (" / ".join(tail) or f"maestro exited {code}")[:300]
 
 
 def screen_ids(hierarchy):
@@ -314,12 +337,25 @@ def log_db_path(app_id, device=None, platform="ios"):
     return path if path and os.path.exists(path) else None
 
 
+def solution_names(log_path):
+    """{solution id: name} from the solution databases beside the log (jigx.solution.___<name>___.<id>.db)."""
+    out = {}
+    for path in glob.glob(os.path.join(os.path.dirname(log_path), "jigx.solution.___*___.*.db")):
+        m = re.search(r"jigx\.solution\.___(.+?)___\.([0-9a-f-]{36})\.db$", os.path.basename(path), re.I)
+        if m:
+            out[m.group(2).lower()] = m.group(1)
+    return out
+
+
 def log_lines(path, since_ms, until_ms):
     """WARNING and ERROR lines the app logged in [since, until], redacted: the cold start's own story
-    (an expression error, a gate still blocking) that no sync tracker sees when no sync runs."""
+    (an expression error, a gate still blocking) that no sync tracker sees when no sync runs. Each
+    line keeps where it came from: the solution (the log is shared by every solution on the
+    device), and for an expression error the expression and its screen; never the evaluated data."""
     if not path:
         return []
-    rows = []
+    rows, names = [], solution_names(path)
+    redact = lambda v: SECRET.sub(lambda x: (x.group(1) or x.group(2)) + "***", str(v))
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
         try:
@@ -330,8 +366,17 @@ def log_lines(path, since_ms, until_ms):
                 except ValueError:
                     continue
                 if m.get("level") in ("WARNING", "ERROR"):
-                    text = SECRET.sub(lambda x: (x.group(1) or x.group(2)) + "***", str(m.get("message", "")))
-                    rows.append({"level": m["level"], "message": re.sub(r"\s+", " ", text)[:160]})
+                    row = {"level": m["level"], "message": re.sub(r"\s+", " ", redact(m.get("message", "")))[:160]}
+                    sid = str(m.get("solutionId") or "").lower()
+                    if sid:
+                        row["solution"] = names.get(sid, sid)
+                    if m.get("category") == "solution.expression":
+                        ctx = next((p for p in m.get("additionalParameters") or [] if isinstance(p, dict) and "expression" in p), {})
+                        screen = ctx.get("screen")
+                        row["expression"] = re.sub(r"\s+", " ", redact(ctx.get("expression", "")))[:200]
+                        if isinstance(screen, dict) and screen.get("screenId"):
+                            row["screen"] = screen["screenId"]
+                    rows.append(row)
         finally:
             conn.close()
     except sqlite3.Error:
@@ -340,20 +385,28 @@ def log_lines(path, since_ms, until_ms):
 
 
 def log_summary(runs):
-    """Per screen: errors and warnings per run, and the most frequent lines across its runs."""
+    """Per screen: errors and warnings per run, and the most frequent lines across its runs, each
+    with the solution, screen and expression it came from when the log says."""
     logged = [r["log"] for r in runs if r.get("log") is not None]
     if not logged:
         return None
     counts = {}
     for lines in logged:
         for line in lines:
-            key = (line["level"], re.sub(r"#\d+ ", "", line["message"]))
+            key = (line["level"], re.sub(r"#\d+ ", "", line["message"]), line.get("solution"), line.get("screen"), line.get("expression"))
             counts[key] = counts.get(key, 0) + 1
     top = sorted(counts.items(), key=lambda kv: (kv[0][0] != "ERROR", -kv[1]))[:6]
     return {"runs": len(logged),
             "errors": [sum(1 for x in lines if x["level"] == "ERROR") for lines in logged],
             "warnings": [sum(1 for x in lines if x["level"] == "WARNING") for lines in logged],
-            "top": [{"level": k[0], "message": k[1], "count": n} for k, n in top]}
+            "top": [{"level": k[0], "message": k[1], "count": n, **{name: v for name, v in zip(("solution", "screen", "expression"), k[2:]) if v}}
+                    for k, n in top]}
+
+
+def log_source(t):
+    """' [solution, screen x]' and the expression of a top log line, when known."""
+    src = ", ".join(x for x in (t.get("solution"), f"screen {t['screen']}" if t.get("screen") else "") if x)
+    return (f" [{src}]" if src else " [the app, no solution]") + (f": `{t['expression']}`" if t.get("expression") else "")
 
 
 def summarise(results, screens=()):
@@ -435,7 +488,7 @@ def report(result, comparison=None):
                   f"Errors per run: {', '.join(map(str, lg['errors']))}; warnings per run: {', '.join(map(str, lg['warnings']))}. "
                   "Lines the app logged between launch and the end of the run (an expression error, a gate still "
                   "blocking): what the time was spent on when no sync runs.", ""]
-        lines += [f"- {t['level']} x{t['count']}: {t['message']}" for t in lg["top"]] or ["- none"]
+        lines += [f"- {t['level']} x{t['count']}{log_source(t)}: {t['message']}" for t in lg["top"]] or ["- none"]
     errors = [(n, r["error"]) for n, s in result["screens"].items() for r in s["runs"] if r.get("error")]
     if errors:
         lines += ["", "## Failed runs", ""] + [f"- {n}: {e}" for n, e in errors[:20]]
@@ -550,12 +603,12 @@ def main(argv=None):
                 try:
                     proc = subprocess.run([maestro] + (["--device", args.device] if args.device else []) + ["test", path],
                                           capture_output=True, text=True, env=maestro_env(), timeout=WARMUP_S)
-                    ok = proc.returncode == 0
+                    ok, why = proc.returncode == 0, maestro_failure(proc.stdout + proc.stderr, proc.returncode)
                 except subprocess.TimeoutExpired:
-                    ok = False
+                    ok, why = False, f"Maestro did not finish within {WARMUP_S} s"
             if not ok:
-                print("Could not follow the path (prepare, --at, --tap); the ids below are of the screen it stopped on.",
-                      file=sys.stderr)
+                print(f"Could not follow the path (prepare, reset, --at, --tap): {why}\n"
+                      "The ids below are of the screen it stopped on.", file=sys.stderr)
         out = subprocess.run([maestro] + (["--device", args.device] if args.device else []) + ["hierarchy"],
                              capture_output=True, text=True, env=maestro_env(), timeout=120).stdout
         try:
@@ -564,6 +617,26 @@ def main(argv=None):
             p.error("maestro hierarchy printed no JSON: " + out.strip()[-300:])
         for rid, text in screen_ids(tree):
             print(f"{rid:60} {text[:60]}")
+        # Leave the app where the next call starts: a pushed screen hides the tab bar, so the next
+        # --ids --at <other screen> would fail in its first step.
+        opened = next((x for x in (spec or {}).get("screens", []) if x["name"] == args.at), None) if args.at else None
+        if opened and steps(opened.get("after"), plat):
+            with tempfile.TemporaryDirectory(prefix="jigx-ids-") as tmp:
+                path = os.path.join(tmp, "after.yaml")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(after_flow(app_id, opened, plat))
+                try:
+                    proc = subprocess.run([maestro] + (["--device", args.device] if args.device else []) + ["test", path],
+                                          capture_output=True, text=True, env=maestro_env(), timeout=WARMUP_S)
+                    back, why = proc.returncode == 0, maestro_failure(proc.stdout + proc.stderr, proc.returncode)
+                except subprocess.TimeoutExpired:
+                    back, why = False, f"Maestro did not finish within {WARMUP_S} s"
+            if not back:
+                print(f"The screen's after steps failed ({why}): the app is still on {args.at}; go back by hand before the next call.",
+                      file=sys.stderr)
+        elif args.at or args.tap:
+            print("The app is left on this screen" + (f" ({args.at} has no after steps)" if args.at else "")
+                  + ": go back before the next call, or it starts from here.", file=sys.stderr)
         return 0
     if not args.spec:
         p.error("give a spec file (or --ids)")
@@ -605,10 +678,11 @@ def main(argv=None):
             try:
                 proc = subprocess.run([maestro] + (["--device", args.device] if args.device else []) + ["test", path],
                                       capture_output=True, text=True, env=maestro_env(), timeout=WARMUP_S)
-                failed = proc.returncode != 0
+                failed, why = proc.returncode != 0, maestro_failure(proc.stdout + proc.stderr, proc.returncode)
             except subprocess.TimeoutExpired:
-                failed = True
+                failed, why = True, f"Maestro did not finish within {WARMUP_S} s"
         if failed:
+            print(f"Failed step: {why}", file=sys.stderr)
             print("The prepare steps failed, so nothing was timed: check the spec's \"prepare\" steps against the "
                   "screen (--ids prints its ids).", file=sys.stderr)
             return 1

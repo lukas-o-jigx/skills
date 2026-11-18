@@ -7,7 +7,7 @@
 // rolled back. Host timings show relative cost on this machine, not device timings.
 //
 //   node time-queries.mjs <solution folder | build/output.json> --db device.db
-//     [--params params.json] [--runs 5] [--report timings.md] [--baseline before.json] [--scale 10]
+//     [--params params.json] [--state state.json] [--runs 5] [--report timings.md] [--baseline before.json] [--scale 10]
 //
 // --scale N also times everything on a second copy with every table's rows multiplied by N,
 // and lists what grows faster than the data (a scan per row, a join no index serves). Keys
@@ -17,8 +17,11 @@
 //
 // params.json binds query parameters by name ({"appointmentId": "AP001"}), or every parameter that
 // reads one solution-state value by the state's name ({"active-project": "BUDGETBYM "}). Without
-// it, a state value gets one value for every query that reads it: the one with the most rows
-// across the columns they compare it with, as stored (padding kept). Any other parameter it does
+// it, a state value is the one the device holds: `track-load.py --copy-db` saves the solution
+// state next to the copy (<db>.state.json; --state <file> names another), so the queries are
+// timed on the project the user picked. Failing that, it gets one value for every query that
+// reads it: the one with the most rows across the columns they compare it with, as stored
+// (padding kept). Any other parameter it does
 // not give is sampled from the column the query compares it with; failing that, it is guessed
 // from a column with the same name (projectId -> ProjectID), taking the value with the most rows
 // (the busiest project), and the report lists every guess. The rest are NULL, which makes most
@@ -27,6 +30,7 @@
 // The database must hold the synced data: copy it with `track-load.py --copy-db`, or pass the
 // live simulator database (it is opened read-only). A plain cp leaves the rows in the -wal file.
 // Read references/run-and-track.md.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -235,8 +239,10 @@ export function growth(base, scaled, factor, {minMs = 10} = {}) {
       const rowsX = b.rows ? r.rows / b.rows : null;
       const inflated = rowsX != null && rowsX > factor * 1.5;
       const verdict = (b.nullParams || r.nullParams) ? 'not measured (NULL parameters)'
+        : (b.emptyTables || r.emptyTables) ? 'not measured (empty tables)'
         : inflated ? 'rows inflated' : r.ms >= minMs && timeX != null && timeX > factor * 2 ? 'GROWS FASTER' : 'in line';
-      rows.push({kind, where: r.where, ms_1x: b.ms, ms_nx: r.ms, time_x: timeX && round(timeX), rows_1x: b.rows, rows_nx: r.rows, verdict});
+      rows.push({kind, where: r.where, ms_1x: b.ms, ms_nx: r.ms, time_x: timeX && round(timeX), rows_1x: b.rows, rows_nx: r.rows, verdict,
+        ...(r.sqlHash && {sqlHash: r.sqlHash})});
     }
   }
   return rows.sort((a, b) => (b.verdict === 'GROWS FASTER') - (a.verdict === 'GROWS FASTER') || b.ms_nx - a.ms_nx);
@@ -313,7 +319,7 @@ export const stateKey = v => /^=?\s*@ctx\.solution\.state\.([\w-]+)\s*$/.exec(St
 // params.json (by the state's name, "active-project", or "@ctx.solution.state.active-project"),
 // else the value with the most rows across the columns those queries compare it with (the busiest
 // project). Values are used as stored: Acumatica pads some keys ("BUDGETBYM ").
-export function stateValues(db, queries, params = {}) {
+export function stateValues(db, queries, params = {}, deviceState = {}) {
   const uses = new Map();
   for (const q of queries) for (const [name, v] of Object.entries(q.parameters ?? {})) {
     const key = stateKey(v);
@@ -323,6 +329,11 @@ export function stateValues(db, queries, params = {}) {
   for (const [key, list] of uses) {
     const given = [`@ctx.solution.state.${key}`, `state.${key}`, key].find(k => k in params);
     if (given) { out[key] = {value: params[given], given: true, queries: list.length}; continue; }
+    // What the device held when the copy was taken: the record the user picked, which the screens show.
+    if (deviceState[key] != null && deviceState[key] !== '' && typeof deviceState[key] !== 'object') {
+      out[key] = {value: deviceState[key], device: true, queries: list.length};
+      continue;
+    }
     const tally = new Map(), from = new Set();
     for (const probe of new Set(list.map(u => sampleQueries(u.sql)[u.name]).filter(Boolean))) {
       const count = probe.replace(/ AS v FROM /, ' AS v, count(*) AS n FROM ').replace(/ LIMIT 1$/, ' GROUP BY v');
@@ -341,9 +352,13 @@ export function stateValues(db, queries, params = {}) {
   return out;
 }
 
-export function timeSolution(app, db, {params = {}, runs = 5, sources = {}} = {}) {
+// A short fingerprint of a query's text (comments and spacing aside), to tell a rewritten query.
+export const sqlHash = sql => crypto.createHash('sha1').update(maskSql(sql).replace(/\s+/g, ' ').trim().toLowerCase() + '|' +
+  [...sql.matchAll(/'(?:''|[^'])*'/g)].map(m => m[0]).join('|')).digest('hex').slice(0, 12);
+
+export function timeSolution(app, db, {params = {}, runs = 5, sources = {}, deviceState = {}} = {}) {
   const {queries, indexes, steps, built} = collect(app);
-  const state = stateValues(db, queries, params);
+  const state = stateValues(db, queries, params, deviceState);
   const stateOf = new Map(queries.map(q => [q.sql, Object.fromEntries(Object.entries(q.parameters ?? {})
     .map(([n, v]) => [n, stateKey(v)]).filter(([n, k]) => k && !(n in params) && !state[k]?.none))]));
   const fromState = (sql, n) => { const k = stateOf.get(sql)?.[n]; return k ? state[k].value : undefined; };
@@ -393,7 +408,7 @@ export function timeSolution(app, db, {params = {}, runs = 5, sources = {}} = {}
   });
 
   const queryResults = queries.map(q => {
-    const base = {where: loc(q.path), copies: q.copies, sampled: Object.keys(sample(q.sql)).filter(n => !(n in params)),
+    const base = {where: loc(q.path), sqlHash: sqlHash(q.sql), copies: q.copies, sampled: Object.keys(sample(q.sql)).filter(n => !(n in params)),
       unbound: unbound(q.sql), ...(Object.keys(stateOf.get(q.sql) ?? {}).length && {state: stateOf.get(q.sql)})};
     const empty = emptyTables(q.sql);
     if (empty) base.emptyTables = empty;
@@ -461,7 +476,10 @@ export function compareTimings(before, after) {
       const diff = Math.abs(r.ms - b.ms), ratio = Math.max(r.ms, b.ms) / Math.max(Math.min(r.ms, b.ms), 0.05);
       const moved = diff >= 5 || (diff >= 1 && ratio >= 2);
       const verdict = !moved ? 'same' : r.ms < b.ms ? 'faster' : change > 10 ? 'SLOWER' : 'same';
-      rows.push({kind, where: r.where, before_ms: b.ms, after_ms: r.ms, change_pct: change, verdict});
+      // The query's text changed: when it took over work expressions did per row, the before time
+      // left that work out, so a slower time is not like for like.
+      const rewritten = !!(b.sqlHash && r.sqlHash && b.sqlHash !== r.sqlHash);
+      rows.push({kind, where: r.where, before_ms: b.ms, after_ms: r.ms, change_pct: change, verdict, ...(rewritten && {rewritten})});
     }
   }
   return rows.sort((a, b) => Math.abs(b.after_ms - b.before_ms) - Math.abs(a.after_ms - a.before_ms));
@@ -469,7 +487,8 @@ export function compareTimings(before, after) {
 
 // The Nx timings of a --scale run, in the shape compareTimings reads.
 export const atScale = growthRows => ({
-  queries: (growthRows ?? []).filter(r => r.kind === 'queries').map(r => ({where: r.where, ms: r.ms_nx})),
+  queries: (growthRows ?? []).filter(r => r.kind === 'queries' && !r.verdict?.startsWith('not measured'))
+    .map(r => ({where: r.where, ms: r.ms_nx, sqlHash: r.sqlHash})),
   actions: (growthRows ?? []).filter(r => r.kind === 'actions').map(r => ({where: r.where, ms: r.ms_nx})),
 });
 
@@ -493,11 +512,12 @@ export function timingsReport({title, result, comparison, comparisonScaled, meta
     ...(guesses.length > 25 ? [`- … ${guesses.length - 25} more in the JSON output (\`guesses\`)`] : []), '');
   const states = Object.entries(result.state ?? {});
   if (states.length) lines.push(`## Solution state (${states.length})`, '',
-    'Parameters that read one solution-state value (the active project) get one value in every query: the value with the most ' +
+    'Parameters that read one solution-state value (the active project) get one value in every query: the value the device ' +
+    'held when the copy was taken (track-load.py --copy-db saves it as <db>.state.json), else the value with the most ' +
     'rows across the columns those queries compare it with, used as stored (padding kept). Pin it with --params ' +
     'params.json ({"<state name>": "value"}).', '',
     ...states.map(([k, v]) => `- ${k} = ${v.none ? 'none found (the compared tables are empty)' : JSON.stringify(v.value)}` +
-      (v.given ? ' (from --params)' : v.none ? '' : ` (${v.rows} rows in ${v.from.join(', ')})`) + `, for ${v.queries} quer${v.queries === 1 ? 'y' : 'ies'}`), '');
+      (v.given ? ' (from --params)' : v.device ? ' (the device\'s solution state)' : v.none ? '' : ` (${v.rows} rows in ${v.from.join(', ')})`) + `, for ${v.queries} quer${v.queries === 1 ? 'y' : 'ies'}`), '');
   const empties = result.queries.filter(q => q.emptyTables && !q.nullParams);
   const emptyRead = [...new Set(result.queries.filter(q => q.emptyTables).flatMap(q => q.emptyTables))].sort();
   if (emptyRead.length) lines.push(`## Empty tables: not measured (${result.queries.filter(q => q.emptyTables).length} queries)`, '',
@@ -519,18 +539,24 @@ export function timingsReport({title, result, comparison, comparisonScaled, meta
       '(a move counts at 5 ms, or at 1 ms when the time at least halves or doubles).', '');
     if (moved.length) {
       lines.push('| What | Where | Before | After | Change |', '| --- | --- | ---: | ---: | ---: |');
-      for (const r of moved.slice(0, 25)) lines.push(`| ${KIND[r.kind]} | \`${r.where}\` | ${r.before_ms} ms | ${r.after_ms} ms | ${r.change_pct ?? '-'}% ${r.verdict === 'SLOWER' ? '⚠' : ''} |`);
+      for (const r of moved.slice(0, 25)) lines.push(`| ${KIND[r.kind]} | \`${r.where}\` | ${r.before_ms} ms | ${r.after_ms} ms | ${r.change_pct ?? '-'}% ${r.verdict === 'SLOWER' ? (r.rewritten ? '⚠ query rewritten' : '⚠') : ''} |`);
       lines.push('');
+      if (moved.some(r => r.rewritten && r.verdict === 'SLOWER')) lines.push('Query rewritten: its text changed since the baseline. ' +
+        'When the new query does work that expressions did per row before, the before time left that work out (expressions are not ' +
+        'timed here), so the two times are not like for like: judge it by the screen time, and fix what its plan shows (a missing index).', '');
     }
   }
   if (growthRows) {
     const faster = growthRows.filter(r => r.verdict === 'GROWS FASTER');
     lines.push(`## Growth at ${scale}x data`, '', `Every table's rows multiplied by ${scale} (${scale > 1 ? `${meta.scaled.linkingKeys} linking keys kept apart per copy` : ''}). ` +
       `${faster.length} item(s) grow faster than the data (more than ${scale * 2}x the time, at ${scale}x data).`, '');
-    const shown = growthRows.filter(r => r.verdict !== 'in line').slice(0, 20);
+    // Not-measured queries (no rows, NULL parameters) timed nothing at either size: their ratio is noise.
+    const unmeasured = growthRows.filter(r => r.verdict.startsWith('not measured')).length;
+    if (unmeasured) lines.push(`${unmeasured} quer${unmeasured === 1 ? 'y was' : 'ies were'} not measured (NULL parameters or empty tables) and left out.`, '');
+    const shown = growthRows.filter(r => r.verdict !== 'in line' && !r.verdict.startsWith('not measured')).slice(0, 20);
     if (shown.length) {
       lines.push('| What | Where | 1x | ' + scale + 'x | Time | Rows | |', '| --- | --- | ---: | ---: | ---: | ---: | --- |');
-      for (const r of shown) lines.push(`| ${KIND[r.kind]} | \`${r.where}\` | ${r.ms_1x} ms | ${r.ms_nx} ms | ${r.time_x ?? '-'}x | ${r.rows_1x ?? '-'} → ${r.rows_nx ?? '-'} | ${r.verdict === 'GROWS FASTER' ? '⚠ grows faster' : r.verdict.startsWith('not measured') ? 'not measured: NULL parameters' : 'rows inflated: a join key the scaling could not separate'} |`);
+      for (const r of shown) lines.push(`| ${KIND[r.kind]} | \`${r.where}\` | ${r.ms_1x} ms | ${r.ms_nx} ms | ${r.time_x ?? '-'}x | ${r.rows_1x ?? '-'} → ${r.rows_nx ?? '-'} | ${r.verdict === 'GROWS FASTER' ? '⚠ grows faster' : 'rows inflated: a join key the scaling could not separate'} |`);
       lines.push('');
     }
     lines.push('Read the query plan of each item that grows faster (`profile-query.py`) before changing it.', '');
@@ -570,7 +596,7 @@ async function main() {
   try {
     const args = process.argv.slice(2);
     const opt = name => { const i = args.indexOf(name); return i >= 0 ? args.splice(i, 2)[1] : undefined; };
-    const dbPath = opt('--db'), reportPath = opt('--report'), paramsPath = opt('--params'), baselinePath = opt('--baseline');
+    const dbPath = opt('--db'), reportPath = opt('--report'), paramsPath = opt('--params'), baselinePath = opt('--baseline'), statePath = opt('--state');
     const runs = Number(opt('--runs') ?? 5), scale = Number(opt('--scale') ?? 1);
     const file = args[0] || 'build/output.json';
     if (!dbPath) throw new Error('--db <device database> is required (track-load.py --list finds simulator databases)');
@@ -598,7 +624,12 @@ async function main() {
       if (!dataRows) throw new Error(`${dbPath} has no data rows (${tables.length} tables), so nothing can be timed. A copy made with cp ` +
         'leaves the rows in the -wal file: copy it with python3 track-load.py --solution <name> --copy-db <file>, or sign in and let the sync finish.');
       const params = paramsPath ? JSON.parse(fs.readFileSync(paramsPath, 'utf8')) : {};
-      const result = timeSolution(loaded.app, db, {params, runs, sources: loaded.sources});
+      // The solution state the device held (track-load.py --copy-db writes it next to the copy).
+      const stateFile = statePath ?? (fs.existsSync(`${dbPath}.state.json`) ? `${dbPath}.state.json` : null);
+      let deviceState = {};
+      if (stateFile) try { deviceState = JSON.parse(fs.readFileSync(stateFile, 'utf8')) ?? {}; }
+        catch (e) { if (statePath) throw new Error(`cannot read --state ${statePath} (${e.message})`); }
+      const result = timeSolution(loaded.app, db, {params, runs, sources: loaded.sources, deviceState});
       const meta = {host: `${os.type()} ${os.arch()}, ${os.cpus()[0]?.model ?? 'unknown CPU'}`, sqlite: db.prepare('SELECT sqlite_version() AS v').get().v,
         db: path.basename(dbPath), tables: tables.length, rows, runs, params: Object.keys(params)};
       db.close();
@@ -613,7 +644,9 @@ async function main() {
         const {queries, steps} = collect(loaded.app);
         meta.scaled = scaleDatabase(sdb, scale, sqlLiterals([...queries.map(x => x.sql), ...steps.flatMap(x => x.statements)]));
         sdb.exec('ANALYZE');
-        const scaledResult = timeSolution(loaded.app, sdb, {params, runs, sources: loaded.sources});
+        // The same state values as the 1x run (given), so both sizes time the same record.
+        const pinned = Object.fromEntries(Object.entries(result.state).filter(([, v]) => !v.none).map(([k, v]) => [k, v.value]));
+        const scaledResult = timeSolution(loaded.app, sdb, {params: {...pinned, ...params}, runs, sources: loaded.sources});
         sdb.close();
         growthRows = growth(result, scaledResult, scale);
         meta.scale = scale;

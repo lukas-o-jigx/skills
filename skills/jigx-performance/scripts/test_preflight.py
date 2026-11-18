@@ -12,6 +12,32 @@ spec.loader.exec_module(pf)
 
 
 class PreflightTest(unittest.TestCase):
+    def test_a_folder_that_lives_on_another_branch_is_found_with_the_command_to_copy_it(self):
+        # Peter's end-to-end rerun: for a solution on another branch it said "no index.jigx" and nothing more
+        d = os.path.realpath(tempfile.mkdtemp())
+        git = lambda *a: subprocess.run(["git", *a], cwd=d, capture_output=True, check=True)
+        commit = lambda m: git("-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "-m", m)
+        git("init", "-q", "-b", "main")
+        with open(os.path.join(d, "README.md"), "w") as f:
+            f.write("x\n")
+        git("add", "."); commit("start")
+        git("checkout", "-q", "-b", "base/time-tracking/time-tracking-v2")
+        os.makedirs(os.path.join(d, "Time-Tracking-V2"))
+        with open(os.path.join(d, "Time-Tracking-V2", "index.jigx"), "w") as f:
+            f.write("name: time-tracking-v2\n")
+        git("add", "."); commit("solution")
+        git("checkout", "-q", "main")
+        folder = os.path.join(d, "Time-Tracking-V2")   # not on main
+        r = pf.code_only(folder)
+        self.assertEqual(r["git"]["branch"], "main")
+        self.assertEqual(r["elsewhere"], {"path": "Time-Tracking-V2", "branches": ["base/time-tracking/time-tracking-v2"], "scanned": 2})
+        out = pf.code_only_text(r)
+        self.assertIn("The folder does not exist on this branch.", out)
+        self.assertIn("The solution is on another branch: base/time-tracking/time-tracking-v2.", out)
+        self.assertIn('git archive base/time-tracking/time-tracking-v2 "Time-Tracking-V2" | tar -x -C', out)
+        missing = pf.code_only_text(pf.code_only(os.path.join(d, "Nope")))
+        self.assertIn("No branch of this repository has a solution at Nope", missing)
+
     def test_reports_solution_branch_and_changes(self):
         d = tempfile.mkdtemp()
         with open(os.path.join(d, "index.jigx"), "w") as f:

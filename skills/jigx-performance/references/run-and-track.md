@@ -147,9 +147,23 @@ use.
      every 3 minutes, and a run that times out that way says "no sign-out seen".
    - The runtime log is shared by every solution in the app: lines another solution wrote
      (its snapshot timeouts, its errors) are left out. The first sign-in after installing
-     the app is marked (`first_sign_in_after_install`), as is a run during which another
+     the app is marked (`first_sign_in_after_install`: the sign-in that created the
+     solution database, with no sign-out before it), as is a run during which another
      solution synced; `compare-runs.py` names those and any run over twice the others on
-     its side, and `--exclude <label>` leaves one out. Run it again rather than keep it.
+     its side, and `--exclude <label>` (repeatable, or comma-separated) leaves one out. Run
+     it again rather than keep it. On a device that holds many solutions every sign-in
+     syncs them, so that is said once for all runs and no run is singled out for it.
+   - The login page: the time any scope is `interrupted` is taken out of the total and of
+     every scope and entry time. The runtime does not always report the pause (seen in 2
+     of 9 sign-ins): `compare-runs.py` then names the run, because the others paused and
+     it did not, or because one call took at least three times and 5 s longer than in the
+     others. Such a run timed the password typing; run it again.
+   - Nothing started within `--start-timeout` (300 s by default, counted from arming or
+     from the sign-out): the run stops there instead of waiting out `--timeout`.
+   - `state_at_scope_start` in the summary is the solution state at every scope start (iOS
+     Simulator; the app keeps it in its AsyncStorage, not in the database), and
+     `--state` prints it now: what a `when:` guard read when a sync that should have been
+     skipped started anyway.
    - Time from the first scope start, not from arming: the wait before it includes the
      user typing credentials.
    - **Acumatica OAuth sign-in** interrupts the identity sync while the login page waits;

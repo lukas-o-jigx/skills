@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
-import {RULES, checkPerformance, cteJoins, filterPredicates, parseCreateIndex, normaliseExpr, loadSolution, markdownReport, newFindings, orAcrossKeys, orderByTerms, outerColumns, riskyCalls, scriptFunctions, sdkSources, shorthandPaths, where} from './check-performance.mjs';
+import {RULES, checkPerformance, cteJoins, filterPredicates, parseCreateIndex, normaliseExpr, loadSolution, markdownReport, newFindings, orAcrossKeys, orderByTerms, outerColumns, riskyCalls, scriptCallRefs, scriptFunctions, sdkSources, shorthandPaths, unguardedDivisions, where} from './check-performance.mjs';
 
 // Fixtures are minimal (no id, rewriteQuery on, loose entities); those checks have their own tests.
 const NOISE = new Set(['unused-datasource', 'rewrite-query-on', 'datasource-no-id', 'watched-table-unread', 'order-by-unindexed']);
@@ -592,4 +592,59 @@ test('a query with several OR lookups across keys is one finding (release/4 oper
   assert.equal(ors.length, 1);
   assert.match(ors[0].message, /^2 OR lookups across keys, e\.g\./);
   assert.equal(ors[0].priority, 'high');
+});
+
+// Peter's end-to-end rerun (13 Nov 2026): three things the audit rated low or missed.
+test('an unindexed join condition on a global or list datasource is medium, and names an index that misses by a TRIM', () => {
+  // Time-Tracking-V2 data-time-activities: 3.4 ms -> 272 ms at 10x data, listed as 4 low findings
+  const join = "SELECT ta.id FROM [timeActivities] ta JOIN [projects] p ON TRIM(json_extract(p.data, '$.ContractCD')) = TRIM(json_extract(ta.data, '$.ProjectID')) " +
+    "WHERE json_extract(ta.data, '$.Status') = 'Open'";
+  const index = col => ({statement: `CREATE INDEX IF NOT EXISTS idx_${col} ON [projects] (json_extract(data, '$.${col}'))`});
+  const app = {datasources: {'data-time-activities': ds(join, ['timeActivities', 'projects'])},
+    jigs: {detail: {type: 'jig.default', datasources: {one: ds(join, ['timeActivities', 'projects'])}}},
+    actions: {idx: {action: {type: 'action.execute-sql', options: {entities: ['default/debug'], statements: [index('ContractCD')]}}}}};
+  assert.deepEqual(filterPredicates(join).map(p => !!p.on), [true, true, false]);
+  const found = checkPerformance(app).findings.filter(f => f.code === 'unindexed-predicate');
+  const global = found.filter(f => f.path.startsWith('$.datasources.'));
+  assert.deepEqual(global.map(f => f.priority), ['medium', 'medium', 'low']); // the two join sides, then the WHERE
+  assert.match(global[0].message, /a join condition: without an index the joined table is scanned once per row/);
+  assert.match(global[0].message, /An index exists on json_extract\(data,'\$\.ContractCD'\), but not with this text/);
+  assert.doesNotMatch(global[1].message, /An index exists/);
+  // the same join in a detail screen's own datasource (no list) stays low
+  assert.deepEqual(found.filter(f => f.path.startsWith('$.jigs.')).map(f => f.priority), ['low', 'low', 'low']);
+  // 1000+ rows on the device: high
+  const sized = checkPerformance(app, {stats: {timeactivities: {rows: 4400, bytes: 1}}}).findings.filter(f => f.code === 'unindexed-predicate' && f.path.startsWith('$.datasources.'));
+  assert.equal(sized[0].priority, 'high');
+});
+
+test('a division by a count nothing tests is flagged; a tested one is not', () => {
+  // Project Central home.jigx: failed on every cold start for a project with no files
+  const bare = '=1 - $count(@ctx.datasources.files[synced = false]) / $count(@ctx.datasources.files.id)';
+  assert.deepEqual(unguardedDivisions(bare), ['$count(@ctx.datasources.files.id)']);
+  assert.deepEqual(unguardedDivisions('=$count(@ctx.datasources.files.id) > 0 ? 1 - $count(@ctx.datasources.files[synced = false]) / $count(@ctx.datasources.files.id) : 0'), []);
+  assert.deepEqual(unguardedDivisions('=$count( @ctx.datasources.files.id ) = 0 ? 0 : 5 / $count(@ctx.datasources.files.id)'), []);
+  assert.deepEqual(unguardedDivisions('="a / $count(x)" & $string(@ctx.jig.inputs.total / 2)'), []);
+  const app = {jigs: {home: {type: 'jig.default', children: [{type: 'component.progress-bar', options: {progress: bare}}]}}};
+  const f = checkPerformance(app).findings.filter(x => x.code === 'expression-may-throw');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].priority, 'medium');
+  assert.match(f[0].message, /^Division by \$count\(@ctx\.datasources\.files\.id\) with nothing testing it/);
+});
+
+test('a datasource field passed unguarded into a script function that throws is one finding per function and field', () => {
+  // Time-Tracking-V2: "Invalid weekStartDay: undefined" 11 times per cold start, from 54 expressions
+  const js = 'function check(day) {\n  if (day === undefined) throw new Error("Invalid weekStartDay: " + day);\n}\n' +
+    'export function getCurrentWeekID(now, weekStartDay) {\n  check(weekStartDay);\n  return 1;\n}\n' +
+    'export function label(value) {\n  return String(value);\n}\n';
+  const call = '$timefunctions.getCurrentWeekID($now(), @ctx.datasources.data-config.weekStartDay)';
+  assert.deepEqual(scriptCallRefs('=' + call), [{script: 'timefunctions', fn: 'getCurrentWeekID', ref: '@ctx.datasources.data-config.weekStartDay'}]);
+  assert.deepEqual(scriptCallRefs(`=@ctx.datasources.data-config.weekStartDay ? ${call} : ()`), []);
+  const app = {scripts: {expressions: {'timefunctions.js': js}}, jigs: {
+    a: {type: 'jig.default', title: '=' + call, subtitle: '=' + call},
+    b: {type: 'jig.default', title: `="Week " & ${call}`, when: `=@ctx.datasources.data-config.weekStartDay ? ${call} > 0 : false`,
+      description: '=$timefunctions.label(@ctx.datasources.data-config.weekStartDay)'}}};
+  const f = checkPerformance(app).findings.filter(x => x.code === 'expression-may-throw');
+  assert.equal(f.length, 1); // three unguarded calls, one finding; label() cannot throw
+  assert.equal(f[0].priority, 'medium');
+  assert.match(f[0].message, /^\$timefunctions\.getCurrentWeekID\(…\) gets @ctx\.datasources\.data-config\.weekStartDay unguarded \(here and in 2 other expressions\)/);
 });

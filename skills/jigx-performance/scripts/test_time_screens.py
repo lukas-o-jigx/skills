@@ -188,9 +188,15 @@ class TimeScreensTest(unittest.TestCase):
         path = os.path.join(d, "jigx.log.db")
         conn = sqlite3.connect(path)
         conn.execute("CREATE TABLE _logMessages (id INTEGER PRIMARY KEY, timestamp INTEGER, state TEXT, message TEXT)")
+        sol = "8a00cc3c-6c1c-40ca-8439-81c9ead89754"
+        open(os.path.join(d, f"jigx.solution.___project-central-dev___.{sol}.db"), "w").close()
         rows = [(1000, {"level": "INFO", "message": "started"}),
                 (2000, {"level": "WARNING", "message": "Gate is still blocking after 18.5 s"}),
-                (3000, {"level": "ERROR", "message": "Failed with error: Bearer abc.def T0410"}),
+                # Peter's end-to-end rerun: with 25 solutions on the device it was not clear whose errors these were
+                (3000, {"level": "ERROR", "category": "solution.expression", "solutionId": sol.upper(),
+                        "message": "Failed with error: Bearer abc.def T0410",
+                        "additionalParameters": [{"expression": "=1 - $count(a) / $count(b)", "evaluated": {"secret": "customer data"},
+                                                  "screen": {"screenId": "home"}}]}),
                 (9000, {"level": "ERROR", "message": "after the run"})]
         for at, m in rows:
             conn.execute("INSERT INTO _logMessages (timestamp, state, message) VALUES (?, 'read', ?)", (at, json.dumps(m)))
@@ -198,14 +204,35 @@ class TimeScreensTest(unittest.TestCase):
         lines = ts.log_lines(path, 1500, 5000)
         self.assertEqual([x["level"] for x in lines], ["WARNING", "ERROR"])
         self.assertNotIn("abc.def", json.dumps(lines))
+        self.assertNotIn("customer data", json.dumps(lines))
+        self.assertEqual((lines[1]["solution"], lines[1]["screen"], lines[1]["expression"]),
+                         ("project-central-dev", "home", "=1 - $count(a) / $count(b)"))
         res = {"label": "pre", "device": "d", "appId": "a", "maestro": "2", "runs": 2,
                "screens": ts.summarise({"cold-start": [{"run": 1, "ms": 20720, "log": lines}, {"run": 2, "ms": 19260, "log": lines[:1]}]},
                                        [{"name": "cold-start", "start": "cold", "ready": "Photos"}])}
         text = ts.report(res)
         self.assertIn("## Runtime log during cold-start", text)
         self.assertIn("Errors per run: 1, 0; warnings per run: 1, 1", text)
-        self.assertIn("- WARNING x2: Gate is still blocking after 18.5 s", text)
+        self.assertIn("- WARNING x2 [the app, no solution]: Gate is still blocking after 18.5 s", text)
+        self.assertIn("- ERROR x1 [project-central-dev, screen home]: `=1 - $count(a) / $count(b)`: Failed with error: Bearer *** T0410", text)
         self.assertEqual(ts.log_lines(None, 0, 1), [])
+
+    def test_ids_at_a_screen_starts_from_reset_goes_back_after_and_names_the_failing_step(self):
+        # Peter's end-to-end rerun: --ids --at left the app on the pushed screen (no tab bar), so the next call failed in prepare
+        spec = {"appId": "a", "prepare": [{"tap": "BUDGETBYM"}], "reset": [{"tap": {"id": "tab-bar.1-home"}}],
+                "screens": [{"name": "photo-logs", "setup": [{"tap": "Projects"}], "tap": "Photo Logs", "ready": "Photos",
+                             "after": [{"tap": {"id": "photo-logs.back.icon"}}]}]}
+        text = ts.path_flow("a", spec, at="photo-logs")
+        self.assertLess(text.index("BUDGETBYM"), text.index("tab-bar.1-home"))        # prepare, then reset
+        self.assertLess(text.index("tab-bar.1-home"), text.index("Projects"))        # reset, then the screen's setup
+        self.assertNotIn("tab-bar.1-home", ts.path_flow("a", spec))                  # no screen named: stay where the app is
+        back = ts.after_flow("a", spec["screens"][0])
+        self.assertIn("photo-logs.back.icon", back)
+        self.assertNotIn("launchApp", back)
+        out = "Running on iPhone\n > Flow\nTap on \"Projects\"... FAILED\nElement not found: Text matching regex: Projects\n"
+        self.assertEqual(ts.maestro_failure(out, 1), 'Tap on "Projects"... FAILED')
+        self.assertEqual(ts.maestro_failure("", 1), "maestro exited 1")
+        self.assertEqual(ts.maestro_failure("a\nb\nc\nd", 1), "b / c / d")
 
 
 if __name__ == "__main__":

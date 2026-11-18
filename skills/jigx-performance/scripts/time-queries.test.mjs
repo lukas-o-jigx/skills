@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {atScale, collect, compareTimings, dataKeys, growth, guessParam, paramNames, sampleQueries, scaleDatabase, sqlLiterals, stateKey, timeSolution, timingsReport} from './time-queries.mjs';
+import {atScale, collect, compareTimings, dataKeys, growth, guessParam, paramNames, sampleQueries, scaleDatabase, sqlHash, sqlLiterals, stateKey, timeSolution, timingsReport} from './time-queries.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -190,4 +190,40 @@ test('parameters that read one solution-state value get one value, the busiest, 
   const pinned = timeSolution(app, db, {runs: 1, params: {'active-project': 'QUIET'}});
   assert.deepEqual(pinned.state['active-project'], {value: 'QUIET', given: true, queries: 3});
   assert.equal(pinned.queries.find(x => x.where === 'datasources/a').rows, 1);
+  // Peter's end-to-end rerun: it picked CSTRHOTEL (most rows) while the screens showed BUDGETBYM.
+  // The state the device held (track-load.py --copy-db writes <db>.state.json) wins over the busiest.
+  const device = timeSolution(app, db, {runs: 1, deviceState: {'active-project': 'QUIET', other: 'x'}});
+  assert.deepEqual(device.state['active-project'], {value: 'QUIET', device: true, queries: 3});
+  assert.equal(device.queries.find(x => x.where === 'datasources/a').rows, 1);
+  assert.match(timingsReport({title: 't', result: device, meta: {host: 'h', sqlite: '3', db: 'd', rows: 6, tables: 3, runs: 1}}),
+    /active-project = "QUIET" \(the device's solution state\), for 3 queries/);
+  // --params still wins, and an empty device value falls back to the busiest
+  assert.equal(timeSolution(app, db, {runs: 1, params: {'active-project': 'OTHER'}, deviceState: {'active-project': 'QUIET'}}).state['active-project'].value, 'OTHER');
+  assert.equal(timeSolution(app, db, {runs: 1, deviceState: {'active-project': ''}}).state['active-project'].value, 'BUDGETBYM ');
+});
+
+test('a rewritten query that is slower says so; not-measured queries stay out of the growth table and the scaled comparison', () => {
+  // Peter's end-to-end rerun: per-row expression filters moved into SQL read as a 0.1 -> 9.3 ms regression at 10x
+  assert.notEqual(sqlHash('SELECT id FROM a'), sqlHash('SELECT id, (SELECT count(*) FROM b) AS n FROM a'));
+  assert.equal(sqlHash('SELECT id  FROM a -- note'), sqlHash('select id from a'));
+  assert.notEqual(sqlHash("SELECT id FROM a WHERE s = 'Open'"), sqlHash("SELECT id FROM a WHERE s = 'Closed'"));
+  const before = {queries: [{where: 'photologs', ms: 0.1, sqlHash: 'aaa'}, {where: 'same-text', ms: 1, sqlHash: 'ccc'}]};
+  const after = {queries: [{where: 'photologs', ms: 9.3, sqlHash: 'bbb'}, {where: 'same-text', ms: 30, sqlHash: 'ccc'}]};
+  const rows = Object.fromEntries(compareTimings(before, after).map(r => [r.where, r]));
+  assert.equal(rows.photologs.verdict, 'SLOWER');
+  assert.equal(rows.photologs.rewritten, true);
+  assert.equal(rows['same-text'].rewritten, undefined);
+  const meta = {host: 'h', sqlite: '3', db: 'd', rows: 6, tables: 3, runs: 1, scaled: {linkingKeys: 2}};
+  const result = {queries: [], actions: [], indexes: []};
+  const base = {queries: [{where: 'real', ms: 1, rows: 10}, {where: 'null-param', ms: 0.1, rows: 0, nullParams: true}, {where: 'empty', ms: 0.1, rows: 0, emptyTables: ['t']}], actions: []};
+  const big = {queries: [{where: 'real', ms: 300, rows: 100}, {where: 'null-param', ms: 1.34, rows: 0, nullParams: true}, {where: 'empty', ms: 2, rows: 0, emptyTables: ['t']}], actions: []};
+  const growthRows = growth(base, big, 10);
+  assert.deepEqual(atScale(growthRows).queries.map(q => q.where), ['real']);
+  const report = timingsReport({title: 't', result, comparison: null, comparisonScaled: compareTimings(before, after), meta, growthRows, scale: 10});
+  assert.match(report, /## Before and after at 10x data\n\n0 faster, 2 slower/);
+  assert.match(report, /\| `photologs` \| 0\.1 ms \| 9\.3 ms \| 9200% ⚠ query rewritten \|/);
+  assert.match(report, /Query rewritten: its text changed since the baseline/);
+  assert.match(report, /2 queries were not measured \(NULL parameters or empty tables\) and left out\./);
+  assert.doesNotMatch(report, /`null-param`|`empty`/);
+  assert.match(report, /\| `real` \| 1 ms \| 300 ms \| 300x/);
 });

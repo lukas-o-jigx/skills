@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {spawnSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
 import {checkSyntax, findJsonata, forParser} from './check-syntax.mjs';
 
 const solution = files => {
@@ -39,4 +41,29 @@ test('an expression that does not parse is named with its place (KOI: a ternary 
   const r = checkSyntax(dir, {jsonata: found.jsonata});
   assert.equal(r.expressions, 2);
   assert.deepEqual(r.errors.map(e => [e.where, e.code]), [['jigs/photos.jigx › placeholders.0.when', 'S0201']]);
+});
+
+// Peter's end-to-end rerun: without jsonata it printed "NOT checked" and exited 0, on a broken copy too.
+test('expressions that could not be checked are not a pass: exit 2, unless --yaml-only', () => {
+  const dir = solution({'jigs/a.jigx': 'title: A\ntype: jig.default\nwhen: =$count(@ctx.datasources.file) > 0 = false :true\n'});
+  const script = fileURLToPath(new URL('./check-syntax.mjs', import.meta.url));
+  // No jsonata anywhere: an empty npm prefix hides the global one, and the folder has none of its own.
+  const env = {...process.env, npm_config_prefix: fs.mkdtempSync(path.join(os.tmpdir(), 'jigx-no-npm-'))};
+  const run = (...args) => spawnSync(process.execPath, [script, dir, ...args], {encoding: 'utf8', env});
+  const none = run();
+  assert.equal(none.status, 2);
+  assert.match(none.stdout, /1 expressions NOT checked/);
+  assert.match(none.stderr, /NOT CHECKED \(exit 2\)/);
+  const yaml = run('--yaml-only');
+  assert.equal(yaml.status, 0);
+  assert.match(yaml.stdout, /not parsed \(--yaml-only\)/);
+});
+
+test('--jsonata takes the package folder or the project folder that holds node_modules', {skip: !found && 'no jsonata package on this machine'}, () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'jigx-project-'));
+  fs.mkdirSync(path.join(project, 'node_modules'), {recursive: true});
+  fs.symlinkSync(found.dir, path.join(project, 'node_modules', 'jsonata'), 'dir');
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'jigx-empty-'));
+  assert.equal(findJsonata(empty, project)?.version, found.version);
+  assert.equal(findJsonata(empty, path.join(project, 'node_modules', 'jsonata'))?.version, found.version);
 });

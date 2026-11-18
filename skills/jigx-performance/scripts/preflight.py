@@ -49,6 +49,8 @@ def solution(folder):
 
 
 def git(folder):
+    while not os.path.isdir(folder) and os.path.dirname(os.path.abspath(folder)) != os.path.abspath(folder):
+        folder = os.path.dirname(os.path.abspath(folder))  # a folder that is not on this branch: the repo above it
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], folder).strip()
     if not branch:
         return None
@@ -180,6 +182,40 @@ def audit_needs(sol):
     return missing
 
 
+def other_branches(folder, limit=5, scan=400):
+    """When the folder holds no solution on this branch: the branches that do have it, and the
+    command that copies it from one without touching the checkout. None outside a git repo."""
+    target = os.path.abspath(folder)
+    cwd = target
+    while not os.path.isdir(cwd) and os.path.dirname(cwd) != cwd:  # the folder itself may not exist here
+        cwd = os.path.dirname(cwd)
+    top = run(["git", "rev-parse", "--show-toplevel"], cwd).strip()
+    if not top:
+        return None
+    rel = os.path.relpath(os.path.realpath(target), os.path.realpath(top)).replace(os.sep, "/")
+    if rel.startswith(".."):
+        return None
+    prefix = "" if rel == "." else rel + "/"
+    refs = run(["git", "for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads", "refs/remotes"], top).split()
+    found, seen = [], set()
+    for ref in refs[:scan]:
+        name = re.sub(r"^origin/", "", ref)
+        if ref.endswith("/HEAD") or name in seen:
+            continue
+        for marker in ("index.jigx", "src/app.ts"):
+            try:
+                ok = subprocess.run(["git", "cat-file", "-e", f"{ref}:{prefix}{marker}"], cwd=top, capture_output=True, timeout=10).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+            if ok:
+                seen.add(name)
+                found.append(ref)
+                break
+        if len(found) >= limit:
+            break
+    return {"path": rel, "branches": found, "scanned": min(len(refs), scan)}
+
+
 def review_folder(folder, sol, g):
     """Where the review's files go: outside the solution repo, one folder per solution and branch."""
     name = sol["name"] or os.path.basename(os.path.abspath(folder))
@@ -191,7 +227,8 @@ def review_folder(folder, sol, g):
 def code_only(folder):
     sol, g = solution(folder), git(folder)
     return {"folder": os.path.abspath(folder), "solution": sol, "git": g, "audit_needs": audit_needs(sol),
-            "review_folder": review_folder(folder, sol, g)}
+            "review_folder": review_folder(folder, sol, g),
+            **({"elsewhere": other_branches(folder)} if not sol["type"] else {})}
 
 
 def preflight(folder):
@@ -208,6 +245,7 @@ def preflight(folder):
            "avds": avds(), "android_other": other}
     sol, g = solution(folder), git(folder)
     return {"folder": os.path.abspath(folder), "solution": sol, "git": g, "review_folder": review_folder(folder, sol, g),
+            **({"elsewhere": other_branches(folder)} if not sol["type"] else {}),
             "ios": booted, "android": devices, "tools": tools(), "env": env}
 
 
@@ -292,6 +330,20 @@ def head(r):
     lines = [f"Solution: {s['name'] or '?'} ({s['type'] or 'no index.jigx or src/app.ts here'}) in {r['folder']}"]
     lines.append(f"Branch: {g['branch']} at {g['commit']}" + (f", {g['uncommitted']} uncommitted change(s)" if g["uncommitted"] else ", clean")
                  if g else "Branch: not a git checkout")
+    if not s["type"]:
+        e = r.get("elsewhere")
+        if not os.path.isdir(r["folder"]):
+            lines.append(f"The folder does not exist{' on this branch' if g else ''}.")
+        if e and e["branches"]:
+            src = os.path.join(r.get("review_folder") or "<review folder>", "src")
+            lines.append(f"The solution is on another branch: {', '.join(e['branches'])}. Copy it from there without touching "
+                         f"this checkout, then run the review on the copy:\n  mkdir -p \"{src}\" && git archive {e['branches'][0]} "
+                         f"\"{e['path']}\" | tar -x -C \"{src}\"\n  (the solution is then in {os.path.join(src, e['path'])})")
+        elif e:
+            lines.append(f"No branch of this repository has a solution at {e['path']} (checked the {e['scanned']} most recent): "
+                         "check the folder name, or fetch the branch first (git fetch origin <branch>).")
+        else:
+            lines.append("Give the folder that holds index.jigx (YAML) or src/app.ts (SDK).")
     if r.get("review_folder"):
         lines.append(f"Review folder: {r['review_folder']} (outside the repo; nothing is written into the checkout)")
     return lines

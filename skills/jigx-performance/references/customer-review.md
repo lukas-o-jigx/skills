@@ -104,15 +104,26 @@ python3 <skill-directory>/scripts/time-screens.py <review>/screens.json --platfo
   datasources' names; the tracker lists the real ones when a name matches nothing. Do not
   time the first sign-in after installing the app (it also loads the app and any other
   solution): the tracker marks it, `compare-runs.py` names it and any run over twice the
-  others, and `--exclude <label>` leaves it out. Log lines other solutions write are not
-  counted.
+  others, and `--exclude <label>` (repeatable) leaves it out; `review-report.py` leaves
+  the same runs out. Log lines other solutions write are not counted. Check the baseline
+  runs before changing anything: `compare-runs.py <review>/runs` with only `pre-*` runs
+  reports the baseline alone. A sign-in sometimes shows no login page pause (the runtime
+  does not report it), so password typing is timed as sync: `compare-runs.py` names that
+  run (no pause where the others had one, or one call far slower than in the others);
+  run it again or exclude it. On a device with many solutions every sign-in syncs them
+  too, which it says once instead of on every run. A run nobody starts stops after
+  `--start-timeout` (300 s). When a fix's `when:` guard does not stop a repeat sync, the
+  summary's `state_at_scope_start` shows the solution state each scope started with.
 - **Queries and actions** run on a copy of the test user's database after the sync, so
   they see real row counts. `--scale 10` repeats every timing on a copy with ten times
   the rows (keys that link tables kept apart per copy) and lists what grows faster than
   the data: a test user's small data set hides those, and they are the ones that get slow
   for a big customer. Read each one's plan with `profile-query.py` before proposing a fix.
   Parameters that read solution state (the active project) get one value in every query:
-  the one with the most rows across the columns they are compared with, padding kept;
+  the value the device held when the copy was taken (`--copy-db` saves it beside the copy
+  as `<file>.state.json`, iOS Simulator only), so the timings are of the project the
+  screens show; without it, the one with the most rows across the columns they are
+  compared with, padding kept;
   other parameters are sampled from the column the query compares them with, else
   guessed from a column with the same name. The report lists them all; pin one with
   `--params params.json` (`{"active-project": "BUDGETBYM "}` sets every parameter that
@@ -194,13 +205,16 @@ For each approved section, in order:
   reordering or parallelising it (`jigx` `sync-orchestration.md`)
 - keep every index or rewrite equivalence-checked (`verifying.md`)
 - add a `check-plans.py` guard for each per-row or per-change lookup you fixed
-- append each change to `<review>/changes.json` as
-  `{"section": "B", "change": "Index orders by reference", "files": ["actions/create-indexes.jigx"]}`
+- record each change: `python3 <skill-directory>/scripts/review-report.py <review> --change
+  "B: Index orders by reference" --files actions/create-indexes.jigx` appends it to
+  `<review>/changes.json` (the section letter first)
 - check it still loads, after every section and before publishing, and stop and report if
   it does not. YAML: `node <skill-directory>/scripts/check-syntax.mjs <solution> <changed
   files>` parses each file and every `=` expression in it with JSONata (any folder, also a
   copy in the review folder; a ` : ` in a plain YAML value, such as a ternary in `when:`,
-  is a YAML error it names). Then the repo's own checks on the changed files, when it has
+  is a YAML error it names). It exits 2, not 0, when it found no jsonata and so parsed no
+  expression: that is not a pass (`--jsonata <the jsonata package, or a project folder
+  with node_modules>`; `--yaml-only` when a YAML-only check is meant). Then the repo's own checks on the changed files, when it has
   them (its README lists them, e.g. `yarn validate <file.jigx>` and `yarn cc:changed --base
   <base>` in jigx-com/acumatica; install first if they need it). SDK: `jigx build`, then the
   `jigx` runtime checker (`check-runtime.mjs` reads `build/output.json` only)

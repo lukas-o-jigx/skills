@@ -3,12 +3,15 @@
 // every .jigx file must parse as YAML, and every expression (a value starting with "=") must
 // parse as JSONata. Run it on the files a fix section changed, before publishing:
 //
-//   node check-syntax.mjs <solution folder> [changed.jigx ...] [--jsonata <path to the jsonata package>]
+//   node check-syntax.mjs <solution folder> [changed.jigx ...] [--jsonata <dir>] [--yaml-only]
 //
 // YAML is parsed with the audit's own loader (Ruby). JSONata comes from the solution's own
 // node_modules, else the global npm folder (jsonata, or the one @jigx/core-sdk ships), else
-// --jsonata; without it only YAML is checked, and the output says so. Jigx's @ctx and @. are read
-// as a variable, which is all the parser needs. Exits 1 on any error. Changes nothing.
+// --jsonata: the jsonata package folder, or a project folder that has node_modules/jsonata.
+// Jigx's @ctx and @. are read as a variable, which is all the parser needs.
+// Exits 0 only when everything was checked and parsed, 1 on any error, and 2 when it could not
+// check: no jsonata was found, so the expressions were not parsed (a pass would be false; as a
+// CI gate this fails the build). --yaml-only says a YAML-only check is intended. Changes nothing.
 import fs from 'node:fs';
 import path from 'node:path';
 import {createRequire} from 'node:module';
@@ -24,7 +27,8 @@ function walk(value, visit, p = '$') {
 // The jsonata package: the solution's own, then the global one (or @jigx/core-sdk's), else null.
 export function findJsonata(folder, given) {
   const tries = [];
-  if (given) tries.push(path.resolve(given));
+  // --jsonata: the package itself, or a project folder with node_modules/jsonata.
+  if (given) tries.push(path.resolve(given), path.join(path.resolve(given), 'node_modules', 'jsonata'));
   try { tries.push(path.dirname(createRequire(path.join(path.resolve(folder), 'x.js')).resolve('jsonata/package.json'))); } catch { /* none */ }
   const root = spawnSync('npm', ['root', '-g'], {encoding: 'utf8'}).stdout?.trim();
   if (root) tries.push(path.join(root, 'jsonata'), path.join(root, '@jigx', 'core-sdk', 'node_modules', 'jsonata'));
@@ -70,18 +74,28 @@ function main() {
   const args = process.argv.slice(2);
   const i = args.indexOf('--jsonata');
   const given = i >= 0 ? args.splice(i, 2)[1] : undefined;
+  const y = args.indexOf('--yaml-only');
+  const yamlOnly = y >= 0;
+  if (yamlOnly) args.splice(y, 1);
   const [folder, ...files] = args;
-  if (!folder) { console.error('usage: node check-syntax.mjs <solution folder> [changed.jigx ...] [--jsonata <dir>]'); process.exitCode = 2; return; }
+  if (!folder) { console.error('usage: node check-syntax.mjs <solution folder> [changed.jigx ...] [--jsonata <dir>] [--yaml-only]'); process.exitCode = 2; return; }
   try {
-    const found = findJsonata(folder, given);
+    const found = yamlOnly ? null : findJsonata(folder, given);
+    if (given && !yamlOnly && !(found && path.resolve(found.dir).startsWith(path.resolve(given))))
+      console.error(`--jsonata ${given}: no jsonata package there, nor in its node_modules` + (found ? `; using ${found.dir}.` : '.'));
     const r = checkSyntax(folder, {files, jsonata: found?.jsonata});
     for (const e of r.yaml) console.log(`YAML  ${e.file}: ${e.message ?? e.error ?? 'does not parse'}`);
     for (const e of r.errors) console.log(`JSONata ${e.where}: ${e.code} ${e.message}\n        =${e.expression}`);
     const scope = files.length ? `${files.length} file(s)` : 'the solution';
     console.log(`${scope}: ${r.yaml.length} YAML error(s); ` + (r.checkedJsonata
       ? `${r.expressions} expressions parsed with jsonata ${found.version}, ${r.errors.length} error(s).`
+      : yamlOnly ? `${r.expressions} expressions not parsed (--yaml-only).`
       : `${r.expressions} expressions NOT checked: no jsonata found (npm i -g jsonata@1.8.9, or pass --jsonata <dir>).`));
-    process.exitCode = r.yaml.length || r.errors.length ? 1 : 0;
+    // Expressions that could not be checked are not a pass: 2, unless YAML alone was asked for.
+    const unchecked = !r.checkedJsonata && !yamlOnly && r.expressions > 0;
+    if (unchecked) console.error('NOT CHECKED (exit 2): the expressions were not parsed, so this is not a pass. ' +
+      'Install jsonata or pass --jsonata <dir>; --yaml-only accepts a YAML-only check.');
+    process.exitCode = r.yaml.length || r.errors.length ? 1 : unchecked ? 2 : 0;
   } catch (e) { console.error(`Syntax check failed: ${e.message}`); process.exitCode = 2; }
 }
 

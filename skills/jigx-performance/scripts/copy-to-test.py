@@ -3,7 +3,8 @@
 
 Standard library only. Copies the solution folder (the one with index.jigx) to --out, sets
 the copy's top-level `name:` and `title:` in index.jigx to the test solution, and copies the
-nearest .vscode/settings.json so Jigx Builder publishes to the same organisation. Refuses a
+nearest .vscode/settings.json that names the organisation (jigx.workspace.organizationId), so
+Jigx Builder publishes to the same one; it says when no settings file has it. Refuses a
 test name equal to the original's: publishing the copy would then overwrite the real
 solution. Then open the copy in VS Code and publish it with Jigx Builder. Read
 references/run-and-track.md.
@@ -12,6 +13,7 @@ Example:
   python3 copy-to-test.py AcumaticaFieldServices --name field-services-test-me --out /tmp/fs-test
 """
 import argparse
+import json
 import os
 import re
 import shutil
@@ -32,23 +34,42 @@ def set_top_level(text, key, value):
     return f"{line}\n{text}"
 
 
-def find_settings(folder, _main=True):
-    """The nearest .vscode/settings.json in the folder or above it, up to the repository root.
-    In a git worktree (.git is a file) the settings are usually not committed, so the same
-    place in the main checkout is searched too."""
+ORG_KEY = "jigx.workspace.organizationId"
+
+
+def has_organisation(path):
+    """Whether a settings.json names the organisation Jigx Builder publishes to."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return False
+    try:
+        return bool(json.loads(text).get(ORG_KEY))
+    except (ValueError, AttributeError):  # VS Code allows comments and trailing commas
+        return bool(re.search(rf'"{re.escape(ORG_KEY)}"\s*:\s*"[^"]+"', text))
+
+
+def find_settings(folder, _main=True, _fallback=None):
+    """The nearest .vscode/settings.json that names the organisation, in the folder or above it, up
+    to the repository root; failing that, the nearest one without it. In a git worktree (.git is a
+    file) the settings are usually not committed, so the same place in the main checkout is
+    searched too."""
     d = os.path.abspath(folder)
     while True:
         path = os.path.join(d, ".vscode", "settings.json")
         if os.path.exists(path):
-            return path
+            if has_organisation(path):
+                return path
+            _fallback = _fallback or path
         git = os.path.join(d, ".git")
         if os.path.isfile(git) and _main:
             main = main_checkout(git)
             if main:
-                return find_settings(os.path.join(main, os.path.relpath(os.path.abspath(folder), d)), _main=False)
-            return None
+                return find_settings(os.path.join(main, os.path.relpath(os.path.abspath(folder), d)), _main=False, _fallback=_fallback)
+            return _fallback
         if os.path.exists(git) or os.path.dirname(d) == d:
-            return None
+            return _fallback
         d = os.path.dirname(d)
 
 
@@ -88,7 +109,7 @@ def copy_to_test(src, out, name, title=None):
     if settings:
         os.makedirs(os.path.join(out, ".vscode"), exist_ok=True)
         shutil.copy(settings, os.path.join(out, ".vscode", "settings.json"))
-    return {"original": original, "settings": settings}
+    return {"original": original, "settings": settings, "organisation": bool(settings) and has_organisation(settings)}
 
 
 def main(argv=None):
@@ -100,8 +121,17 @@ def main(argv=None):
     args = p.parse_args(argv)
     r = copy_to_test(args.solution, args.out, args.name, args.title)
     print(f"Copied {r['original'] or args.solution} to {args.out} as {args.name}.")
-    print("Organisation settings: " + (f"copied from {r['settings']}" if r["settings"]
-                                       else "none found; set jigx.workspace.organizationId in the copy's .vscode/settings.json"))
+    target = os.path.join(args.out, ".vscode", "settings.json")
+    fix = (f'add "{ORG_KEY}": "<organisation id>" to {target} (copy the line from the solution repo\'s '
+           ".vscode/settings.json, or from another solution that publishes to the same organisation), or Jigx Builder "
+           "will ask where to publish")
+    if r["organisation"]:
+        print(f"Organisation settings: copied from {r['settings']}")
+    elif r["settings"]:
+        print(f"Organisation settings: NOT FOUND. {r['settings']} was copied, but it has no {ORG_KEY}: {fix}.")
+    else:
+        print(f"Organisation settings: NOT FOUND (no .vscode/settings.json in {os.path.abspath(args.solution)} or above it, "
+              f"up to the repository root): {fix}.")
     print(f"Next: open {args.out} in VS Code and publish it with Jigx Builder, then time the test solution {args.name}.")
     return 0
 

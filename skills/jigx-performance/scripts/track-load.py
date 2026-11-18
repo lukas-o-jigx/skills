@@ -25,7 +25,12 @@ any tracked scope is interrupted is subtracted from the totals, scope and entry 
 "Signing out" log line or a recreated database starts the run again (a build that
 reloads can sync once before the sign-out). Armed while a sync was already running, the
 run ends "invalid" once that sync finishes: arm first, then sign in. While nothing has
-started it says when the app is syncing another solution instead.
+started it says when the app is syncing another solution instead, and after --start-timeout
+seconds (default 300) with nothing started it stops instead of waiting out --timeout.
+
+The solution's state (what a `when:` guard reads) is saved at every scope start, as
+state_at_scope_start in the summary: the app persists it in its AsyncStorage (iOS Simulator
+only), so a guard that did not hold can be read from the run. --state prints it now.
 
 Each sign-in run needs a fresh sign-in: start the tracker, then sign out of the app and
 sign in again (or sign in for the first time). With --scopes, names that match no scope are
@@ -33,7 +38,8 @@ reported together with the scope ids the app does have (the sync actions' instan
 the names of the progress datasources).
 
 --copy-db OUT makes a copy of the solution database for time-queries.mjs and the row-count
-check: through SQLite's backup, so rows still in the -wal file are included (a plain cp
+check (and writes the solution state next to it as OUT.state.json, which time-queries.mjs
+binds state parameters from: the project the user picked, not the busiest one): through SQLite's backup, so rows still in the -wal file are included (a plain cp
 leaves them out and gives an empty database), and switched out of WAL mode so it opens
 read-only on its own.
 
@@ -54,11 +60,13 @@ Examples:
   python3 track-load.py --db path/to/jigx.solution.___x___.<uuid>.db --scopes sync-base,sync-lookups
   python3 track-load.py --android --solution my-solution-test --wait --label pre-android-1
   python3 track-load.py --solution my-solution-test --copy-db <review>/before/device.db
+  python3 track-load.py --solution my-solution-test --state
 """
 import argparse
 import contextlib
 import datetime
 import glob
+import hashlib
 import json
 import os
 import platform
@@ -232,15 +240,17 @@ def solution_id(path):
     return m.group(1).lower() if m else None
 
 
-def first_sign_in_after_install(db, armed, window_s=3600):
-    """True when the app was installed (its iOS Simulator container created) within window_s before
-    arming and nothing has signed out since: the first sign-in on a fresh install also loads the
-    app and its other solutions, so it is slower than the runs after it. None when unknown (Android)."""
-    m = re.match(r"(.*/Containers/Data/Application/[^/]+)/", db)
-    if db.startswith("adb:") or not m:
+def first_sign_in_after_install(db, armed, window_s=60):
+    """True when nobody has signed in to this install before: the solution database was created
+    by this sign-in (within window_s before arming, or after it) and the app's log holds no
+    sign-out from before arming. The first sign-in also loads the app and its other solutions, so
+    it is slower than the runs after it. How long ago the app was installed does not matter: an
+    app installed in the morning and first signed in to after lunch is still a first sign-in.
+    None when unknown (Android, or a file system without creation times)."""
+    if db.startswith("adb:"):
         return None
     try:
-        born = os.stat(m.group(1)).st_birthtime * 1000
+        born = os.stat(db).st_birthtime * 1000
     except (OSError, AttributeError):
         return None
     if born < armed - window_s * 1000:
@@ -252,6 +262,50 @@ def first_sign_in_after_install(db, armed, window_s=3600):
     except sqlite3.Error:
         return None
     return not signed_out
+
+
+SECRET_KEY = re.compile(r"token|password|secret|api[-_]?key|credential|authorization", re.I)
+
+
+def solution_state(db, full=False):
+    """The solution's state as the app last persisted it, {name: value}, or None when it cannot
+    be read (Android, or no state saved yet). The app keeps it in React Native's AsyncStorage
+    under persist:solution -> instances[<solution id>].state, not in the solution database.
+    Values under a name that looks like a credential are masked; others are cut to 120
+    characters unless `full` (the copy time-queries.mjs binds parameters from needs them whole)."""
+    sid = solution_id(db)
+    if db.startswith("adb:") or not sid:
+        return None
+    library = os.path.dirname(os.path.dirname(db))
+    for manifest in glob.glob(os.path.join(library, "Application Support", "*", "RCTAsyncLocalStorage_V1", "manifest.json")):
+        try:
+            with open(manifest, encoding="utf-8") as f:
+                stored = json.load(f)
+            raw = stored.get("persist:solution")
+            if raw is None and "persist:solution" in stored:  # a large value lives in its own file
+                name = hashlib.md5(b"persist:solution").hexdigest()
+                with open(os.path.join(os.path.dirname(manifest), name), encoding="utf-8") as f:
+                    raw = f.read()
+            unpack = lambda v: json.loads(v) if isinstance(v, str) else v
+            instances = unpack(unpack(raw or "{}").get("instances") or {})
+            state = next((unpack(v.get("state")) for k, v in instances.items() if k.lower() == sid and isinstance(v, dict)), None)
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(state, dict):
+            out = {}
+            for k, v in state.items():
+                if SECRET_KEY.search(k):
+                    out[k] = "***"
+                elif v is None or isinstance(v, (bool, int, float)):
+                    out[k] = v
+                elif isinstance(v, str):
+                    text = redact(v)
+                    out[k] = text if full or len(text) <= 120 else text[:120] + "…"
+                else:  # an object or a list
+                    text = redact(json.dumps(v))
+                    out[k] = v if full else text if len(text) <= 120 else text[:120] + "…"
+            return out
+    return None
 
 
 def connect(path):
@@ -523,7 +577,9 @@ def summarise(label, db, samples, result, armed, ready_at, logs, final, scopes):
     def scope_duration(sid, v):
         if not (v and v["syncedAt"] and v["startedAt"] and v["syncedAt"] >= v["startedAt"]):
             return None
-        cut = overlap_ms(v["startedAt"], v["syncedAt"], paused_spans(samples, armed, sid)) if samples else 0
+        # Any scope's interruption: a scope that started and then waited for the identity scope's
+        # login page was not syncing either (the total already leaves that time out).
+        cut = overlap_ms(v["startedAt"], v["syncedAt"], paused) if samples else 0
         return round((v["syncedAt"] - v["startedAt"] - cut) / 1000, 2)
     snapshot = {}
     for row in logs:
@@ -553,7 +609,7 @@ def summarise(label, db, samples, result, armed, ready_at, logs, final, scopes):
         "scopes": {sid: {"state": v["state"], "duration_s": scope_duration(sid, v),
                          # The scope's first sync (with any resume after an interruption): what the
                          # sign-in waits for. duration_s is its last sync, which a repeat moves.
-                         "first_duration_s": first_sync_s(runs.get(sid), paused_spans(samples, armed, sid))}
+                         "first_duration_s": first_sync_s(runs.get(sid), paused)}
                    for sid, v in run.items() if v},
         "entries": entries,
         "serial_entries": serial_chain(entries),
@@ -575,7 +631,7 @@ def samples_started(samples, scopes, armed):
 
 
 def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeout=900.0, stream=sys.stdout, unknown_wait=10.0,
-          remind_after=180.0):
+          remind_after=180.0, start_timeout=300.0):
     os.makedirs(out, exist_ok=True)
     log_db = os.path.join(os.path.dirname(db), "jigx.log.db")
     sol = solution_id(db)
@@ -586,6 +642,7 @@ def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeo
     result, ready_since, ready_at, final = "timeout", None, None, None
     started_at, restarts, before_arming, idle_since, others_checked = armed, 0, set(), None, 0
     announced, unknown_told, unknown_since, reminded = set(), set(), None, 0
+    seen_starts, state_log, gave_up = {}, [], False
     inode = file_id(db)
     print(f"Tracking {solution_name(db)} as '{label}'. Start the load now: for a sign-in, sign out of the app and "
           "sign in again (every run needs a fresh sign-in); otherwise refresh or open the screen.",
@@ -607,6 +664,7 @@ def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeo
                 inode, restarts = file_id(db), restarts + 1
                 armed, samples, logs, last_sig, ready_since, ready_at = now_ms(), [], [], None, None, None
                 before_arming.clear()
+                seen_starts, state_log = {}, []
                 jsonl.write(json.dumps({"at": iso(armed), "restart": "sign-out" if signed_out else "database recreated"}) + "\n")
                 print(f"{t:7.2f}s  {'Sign-out seen' if signed_out else 'Database recreated'}: the run starts again from here.",
                       file=stream, flush=True)
@@ -622,6 +680,14 @@ def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeo
                 jsonl.write(json.dumps({"at": iso(now_ms()), "t": round(t, 3), **state}) + "\n")
                 jsonl.flush()
                 print(live_line(t, state, scopes, armed), file=stream, flush=True)
+                # What a when: guard read when each scope started (a guard that did not hold shows here).
+                for sid, v in state["scopes"].items():
+                    if fresh(v, armed) and seen_starts.get(sid) != v["startedAt"]:
+                        seen_starts[sid] = v["startedAt"]
+                        snap = solution_state(db)
+                        if snap is not None:
+                            last = next((x["state"] for x in reversed(state_log) if isinstance(x["state"], dict)), None)
+                            state_log.append({"t": round(t, 2), "scope": sid, "state": "unchanged" if snap == last else snap})
             # A named scope's row can appear only when it starts (the one after it in a chain):
             # warn only when nothing is syncing and the names still match nothing after a while.
             idle = not any(v["state"] in ("syncing", "interrupted") for v in state["scopes"].values())
@@ -645,6 +711,11 @@ def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeo
                     print(f"{t:7.2f}s  Nothing has started and no sign-out seen after {waited / 60:.0f} min: sign out of "
                           f"{solution_name(db)} in the app and sign in again (each run needs a fresh sign-in), or Ctrl-C.",
                           file=stream, flush=True)
+            if st == "waiting" and not before_arming and start_timeout and now_ms() - armed >= start_timeout * 1000:
+                gave_up = True
+                print(f"{t:7.2f}s  Nothing started in {start_timeout:g} s, so tracking stops here (--start-timeout).",
+                      file=stream, flush=True)
+                break
             if st == "waiting":
                 pool = {s: state["scopes"].get(s) for s in scopes} if scopes else state["scopes"]
                 running = {s for s, v in pool.items() if v and v["state"] in ("syncing", "interrupted") and (v["startedAt"] or 0) < armed}
@@ -684,15 +755,19 @@ def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeo
     summary["interval_s"] = interval
     summary["other_solutions_synced"] = sorted(announced)
     summary["first_sign_in_after_install"] = first_sign_in_after_install(db, armed)
+    summary["state_at_scope_start"] = state_log
     if result == "timeout" and not samples_started(samples, scopes, armed):
         summary["timeout_reason"] = "no sign-out seen and nothing started" if not restarts else "nothing started after the sign-out"
+        if gave_up:
+            summary["timeout_reason"] += f" in {start_timeout:g} s"
     with open(os.path.join(out, f"{label}-summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     total = summary["first_start_to_ready_s"]
     reason = f" ({summary['timeout_reason']})" if summary.get("timeout_reason") else ""
     print("\n".join(["", f"{label}: {result}{reason}, first start to ready {'n/a' if total is None else f'{total}s'}", ""]
                     + waterfall(summary["entries"])), file=stream)
-    print(f"Sync busy {summary['sync_busy_s']}s, {sum(summary['scope_starts'].values())} scope start(s)", file=stream)
+    if summary["sync_busy_s"] is not None:
+        print(f"Sync busy {summary['sync_busy_s']}s, {sum(summary['scope_starts'].values())} scope start(s)", file=stream)
     if summary["serial_entries"]:
         print(f"{len(summary['serial_entries'])} calls ran strictly one after another: "
               f"{', '.join(summary['serial_entries'][:6])}{' …' if len(summary['serial_entries']) > 6 else ''}; "
@@ -703,6 +778,12 @@ def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeo
     for sid in summary["repeated_scopes"]:
         print(f"WARNING: {sid} synced {summary['scope_starts'][sid]} times in one run; look for an onFocus or "
               "onLoad that starts the same sync again", file=stream)
+        again = [x for x in state_log if x["scope"] == sid][1:2]
+        held = again and next((x["state"] for x in reversed(state_log[:state_log.index(again[0]) + 1]) if isinstance(x["state"], dict)), None)
+        if held:
+            shown = ", ".join(f"{k}={json.dumps(v)}" for k, v in list(held.items())[:12])
+            print(f"         solution state at its second start ({again[0]['t']}s): {shown}"
+                  f"{' …' if len(held) > 12 else ''}; a when: guard on one of these did not stop it", file=stream)
     if summary["snapshot_timeouts"]:
         print(f"Timeout for first snapshot: {summary['snapshot_timeouts']}", file=stream)
     if summary["first_sign_in_after_install"]:
@@ -734,6 +815,9 @@ def main(argv=None):
     p.add_argument("--interval", type=float, default=0.25)
     p.add_argument("--settle", type=float, default=5.0, help="seconds ready must hold before stopping")
     p.add_argument("--timeout", type=float, default=900.0)
+    p.add_argument("--start-timeout", type=float, default=300.0,
+                   help="seconds to wait for the first scope to start (from arming, or from the sign-out) before stopping; 0 waits for --timeout")
+    p.add_argument("--state", action="store_true", help="print the solution's state as the app last saved it (iOS Simulator) and exit")
     p.add_argument("--copy-db", metavar="OUT", help="copy the solution database to OUT (rows in the -wal file included) and exit")
     args = p.parse_args(argv)
     android = android_serial(args.android) if args.android else None
@@ -767,15 +851,28 @@ def main(argv=None):
         db = found[0]
     if not db:
         p.error("give --db or --solution (see --list)")
+    if args.state:
+        state = solution_state(db)
+        if state is None:
+            print("No solution state found (Android, or the app has not saved any yet).", file=sys.stderr)
+            return 1
+        print(json.dumps(state, indent=2))
+        return 0
     if args.copy_db:
         rows = copy_db(db, args.copy_db)
         print(f"Copied {solution_name(db)} to {args.copy_db}: {rows} data rows")
+        state = solution_state(db, full=True)
+        if state is not None:
+            with open(args.copy_db + ".state.json", "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+            print(f"Solution state ({len(state)} values) saved to {args.copy_db}.state.json; time-queries.mjs binds state parameters from it")
         if not rows:
             print("The copy has no data rows: sign in and let the sync finish first.", file=sys.stderr)
             return 1
         return 0
     scopes = [s for s in args.scopes.split(",") if s]
-    summary = track(db, args.label, args.out, args.table, scopes, args.interval, args.settle, args.timeout)
+    summary = track(db, args.label, args.out, args.table, scopes, args.interval, args.settle, args.timeout,
+                    start_timeout=args.start_timeout)
     return 0 if summary["result"] == "ready" else 1
 
 

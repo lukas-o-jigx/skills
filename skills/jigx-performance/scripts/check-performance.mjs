@@ -84,12 +84,14 @@ export function filterPredicates(query) {
       else if (c === ')') { if (depth === 0) break; depth--; }
       else if (depth === 0 && /^\s*\b(GROUP\s+BY|ORDER\s+BY|LIMIT|UNION|EXCEPT|INTERSECT|WHERE|JOIN|LEFT|INNER|CROSS|WINDOW)\b/i.test(masked.slice(i, i + 12)) && /\s/.test(masked[i - 1] ?? ' ')) break;
     }
-    regions.push([m.index + m[0].length, i]);
+    regions.push([m.index + m[0].length, i, m[1].toUpperCase()]);
   }
   const preds = new Map();
   for (const m of masked.matchAll(/\bjson_extract\s*\(/gi)) {
     const at = m.index;
-    if (!regions.some(([a, b]) => at >= a && at < b)) continue;
+    // The innermost clause it sits in: a WHERE inside a subquery of an ON is a WHERE.
+    const region = regions.filter(([a, b]) => at >= a && at < b).sort((x, y) => (x[1] - x[0]) - (y[1] - y[0]))[0];
+    if (!region) continue;
     let start = at, end = matchParen(masked, at + m[0].length - 1);
     if (end < 0) continue;
     let wrapped = false;
@@ -109,9 +111,12 @@ export function filterPredicates(query) {
     }
     const after = masked.slice(end + 1, end + 12);
     const expr = query.slice(start, end + 1);
-    preds.set(normaliseExpr(expr), {
+    const norm = normaliseExpr(expr);
+    preds.set(norm, {
       expr: expr.replace(/\s+/g, ' ').trim(),
       wrapped,
+      // In a JOIN's ON: evaluated for every pair of rows the join considers, not once per row.
+      on: region[2] === 'ON' || !!preds.get(norm)?.on,
       like: /^\s*(NOT\s+)?LIKE\b/i.test(after),
       multiArm: (expr.match(/json_extract\s*\(/gi) || []).length > 1,
     });
@@ -139,6 +144,41 @@ export function riskyCalls(expr) {
     const tested = new RegExp(`${esc}(?:\\s*\\))*\\s*(\\?|\\band\\b|\\bor\\b|!=|=|>|<)`).test(rest);
     if (typed || (!ref.includes('.components.') && tested)) continue;
     out.push({fn, ref});
+  }
+  return out;
+}
+
+// Divisions by a count, sum or length that nothing in the expression tests: with 0 the result is
+// no number (0/0, x/0), and the operator around it then fails (verified with jsonata 1.8.9:
+// `1 - $count(a) / $count(b)` with both empty throws T2002).
+export function unguardedDivisions(expr) {
+  const e = withoutJsonataStrings(expr), squash = t => t.replace(/\s+/g, ''), out = new Set();
+  for (const m of e.matchAll(/\/\s*(\$(?:count|sum|length)\s*\()/g)) {
+    const open = m.index + m[0].length - 1, close = matchParen(e, open);
+    if (close < 0) continue;
+    const divisor = e.slice(open - m[1].length + 1, close + 1);
+    const rest = squash(e.slice(0, m.index) + ' ' + e.slice(close + 1));
+    if (new RegExp(escapeRe(squash(divisor)) + '\\)*(\\?|>|<|!=|=)').test(rest)) continue;
+    out.add(divisor.replace(/\s+/g, ' '));
+  }
+  return [...out];
+}
+
+// Datasource fields passed straight into a call of the solution's own script function
+// ($timefunctions.getCurrentWeekID($now(), @ctx.datasources.data-config.weekStartDay)) with
+// nothing in the expression testing them: undefined until the datasource has loaded.
+export function scriptCallRefs(expr) {
+  const e = withoutJsonataStrings(expr), out = [];
+  for (const m of e.matchAll(/\$([\w-]+)\.(\w+)\s*\(/g)) {
+    const open = m.index + m[0].length - 1, close = matchParen(e, open);
+    if (close < 0) continue;
+    for (const arg of splitTop(e.slice(open + 1, close))) {
+      if (!/^@ctx\.datasources\.[\w-]+\.[\w-]+$/.test(arg)) continue;
+      const esc = escapeRe(arg);
+      const rest = (e.slice(0, m.index) + ' ' + e.slice(close + 1)).replace(new RegExp('\\$exists\\(\\s*' + esc + '\\s*\\)', 'g'), '');
+      if (new RegExp(esc + '(?:\\s*\\))*\\s*(\\?|\\band\\b|\\bor\\b|!=|=|>|<)').test(rest)) continue;
+      out.push({script: m[1], fn: m[2], ref: arg});
+    }
   }
   return out;
 }
@@ -435,6 +475,10 @@ export function checkPerformance(app, {stats = null, sources = {}} = {}) {
   const scriptBodies = new Map();
   for (const files of Object.values(app.scripts ?? {})) for (const [file, text] of Object.entries(files ?? {}))
     if (typeof text === 'string') for (const f of scriptFunctions(text)) scriptBodies.set(`${file.replace(/\.js$/, '')}.${f.name}`, f.body);
+  // Every function of each script file, helpers included (not callable from expressions, but called by the ones that are).
+  const scriptHelpers = new Map();
+  for (const files of Object.values(app.scripts ?? {})) for (const [file, text] of Object.entries(files ?? {}))
+    if (typeof text === 'string') for (const f of scriptFunctions(text, {helpers: true})) scriptHelpers.set(`${file.replace(/\.js$/, '')}.${f.name}`, f.body);
   const realGuard = w => {
     if (w === undefined || w === null || w === true) return false;
     const s = String(w).trim();
@@ -468,6 +512,15 @@ export function checkPerformance(app, {stats = null, sources = {}} = {}) {
     severity, priority: priority ?? RULES[code].priority, section: RULES[code].section, code, path,
     where: where(path, sources), message, fix: RULES[code].fix});
 
+  // Whether a script function can throw: a throw in its own body, or in a function of the same
+  // file that it calls (a shared validator).
+  const scriptThrows = (script, fn) => {
+    const body = scriptBodies.get(`${script}.${fn}`);
+    if (body === undefined || body === null) return false;
+    if (/\bthrow\b/.test(body)) return true;
+    return [...body.matchAll(/\b(\w+)\s*\(/g)].some(m => m[1] !== fn && /\bthrow\b/.test(scriptHelpers.get(`${script}.${m[1]}`) ?? ''));
+  };
+  const scriptArgs = new Map();
   const datasources = [], ddlActions = [], indexes = [], syncs = [], calls = {}, listSources = new Set(), listItems = new Map();
   const refs = new Map(), readTables = new Set();
   let sqlText = '';
@@ -543,10 +596,27 @@ export function checkPerformance(app, {stats = null, sources = {}} = {}) {
         const grade = throwRisk(r, path);
         if (grade) add('expression-may-throw', `${path}.${key}`, throwMessage(r), {priority: grade});
       }
+      for (const divisor of unguardedDivisions(value))
+        add('expression-may-throw', `${path}.${key}`, `Division by ${divisor} with nothing testing it: when it is 0 the result is no number ` +
+          `and the expression fails (T2002) or shows nothing. Guard it: ${divisor} > 0 ? … / ${divisor} : 0.`, {priority: 'medium'});
+      // One finding per function and field, not per expression: one config field often feeds a
+      // function from a hundred places, and the fix (a guard in the function) is one change.
+      for (const c of scriptCallRefs(value)) {
+        if (!scriptThrows(c.script, c.fn)) continue; // not the solution's function, or it cannot throw
+        const id = `${c.script}.${c.fn}|${c.ref}`;
+        const seen = scriptArgs.get(id) ?? scriptArgs.set(id, {...c, path: `${path}.${key}`, count: 0}).get(id);
+        seen.count++;
+      }
       const filters = (expr.match(/@ctx\.datasources\.[\w-]+\s*\[|\$filter\(\s*@ctx\.datasources/g) ?? []).length;
       if (filters >= 10) add('heavy-expression', `${path}.${key}`, `One expression filters datasources ${filters} times each time it is evaluated.`);
     }
   });
+
+  for (const c of scriptArgs.values())
+    add('expression-may-throw', c.path, `$${c.script}.${c.fn}(…) gets ${c.ref} unguarded` +
+      (c.count > 1 ? ` (here and in ${c.count - 1} other expression${c.count > 2 ? 's' : ''})` : '') +
+      `: it is undefined until the datasource has loaded, and when it has no row, and ${c.fn} throws on a value it does not accept. ` +
+      `Handle undefined in the function (one change), or guard each call: ${c.ref} ? $${c.script}.${c.fn}(…) : ().`, {priority: 'medium'});
 
   // How likely a strict call is to throw: a component value can be any type (the errors seen in
   // device logs), a list row's column can be NULL for some rows. A column the query COALESCEs is
@@ -649,7 +719,18 @@ export function checkPerformance(app, {stats = null, sources = {}} = {}) {
         add('wrapped-predicate', `${path}.options.query`, `${p.expr} wraps several json_extract arms in functions, so no index on either arm can be used.`, sized);
         continue;
       }
-      if (!indexed.has(p.norm)) add('unindexed-predicate', `${path}.options.query`, `No shipped CREATE INDEX matches ${p.expr}${rows ? ` (${rows} rows)` : ''}.`, sized);
+      if (indexed.has(p.norm)) continue;
+      // An index on the same column without the wrapper (TRIM(json_extract(…)) against an index
+      // on json_extract(…)) is not used: SQLite matches the indexed expression's exact text.
+      const near = p.wrapped ? [...indexed].find(x => x !== p.norm && x.includes('json_extract(') && p.norm.includes(x)) : null;
+      // A join's ON on a global or list datasource runs per pair of rows and on every refresh:
+      // unindexed, it scans the joined table once per row, so the cost grows with rows x rows.
+      const hot = p.on && (/^\$\.datasources\.[^.]+$/.test(path) || typeof node.datasourceId === 'string' || listSources.has(node));
+      add('unindexed-predicate', `${path}.options.query`,
+        `No shipped CREATE INDEX matches ${p.expr}${rows ? ` (${rows} rows)` : ''}` +
+        (p.on ? ', a join condition: without an index the joined table is scanned once per row, so the time grows with rows × rows' : '') + '.' +
+        (near ? ` An index exists on ${near}, but not with this text: SQLite uses an expression index only for exactly the indexed expression, so index ${p.expr} (or use the indexed text on both sides of the join).` : ''),
+        hot ? {priority: rows >= 1000 ? 'high' : 'medium'} : sized);
     }
   }
 
@@ -908,11 +989,11 @@ export function loadSolution(dir) {
 }
 
 // Exported functions of an expression script: name, body text and line count.
-export function scriptFunctions(text) {
+export function scriptFunctions(text, {helpers = false} = {}) {
   const out = [];
   for (const m of text.matchAll(/^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\([^)]*\)\s*\{|^\s*exports\.(\w+)\s*=\s*(?:async\s+)?function\s*\w*\s*\([^)]*\)\s*\{/gm)) {
     const name = m[1] ?? m[2];
-    if (!/^\s*(export|exports)/.test(m[0])) continue; // helpers are not callable from expressions
+    if (!helpers && !/^\s*(export|exports)/.test(m[0])) continue; // helpers are not callable from expressions
     let depth = 0, i = m.index + m[0].length - 1;
     for (; i < text.length; i++) {
       if (text[i] === '{') depth++;

@@ -22,6 +22,13 @@ and writes <folder>/report.md (and prints it): an overview of every area, then s
 function (sync step), query, action and screen times
 before and after, findings per section A-H before and after, the changes applied per
 section, and what was not measured. With only the before files it writes the overview used for the proposal.
+Runs that compare-runs.py left out with --exclude (recorded in comparison.json) are left out
+here too, so both show the same medians; --exclude adds more. A query that is slower only at
+the scaled data (time-queries.mjs --scale with --baseline) is listed with the queries.
+
+  python3 review-report.py <review> --change "B: TRIM() indexes for the time-activities join" --files datasources/a.jigx
+
+appends one change to changes.json (the section letter, then what changed) and exits.
 Read references/customer-review.md.
 
 Example:
@@ -114,15 +121,17 @@ def section_rows(before, after):
     return rows
 
 
-def load_runs(folder, prefix):
+def load_runs(folder, prefix, excluded=()):
     """track-load.py summaries labelled <prefix> or <prefix>-<anything> in <folder>/runs (pre-1, pre-clean-2),
-    but not <prefix>-android-…, which is the Android side."""
+    but not <prefix>-android-…, which is the Android side, nor a run whose label is in `excluded`."""
     label = re.compile(rf"{re.escape(prefix)}(?:-(?!android)[\w.]+(?:-[\w.]+)*)?-summary\.json")
     out = []
     for path in sorted(glob.glob(os.path.join(folder, "runs", f"{prefix}*-summary.json"))):
         if label.fullmatch(os.path.basename(path)):
             with open(path, encoding="utf-8") as f:
-                out.append(json.load(f))
+                run = json.load(f)
+            if run.get("label") not in excluded:
+                out.append(run)
     return out
 
 
@@ -152,6 +161,10 @@ def function_lines(pre, post):
 
 
 def timing_lines(comparison, pre=None):
+    if comparison and (comparison.get("baseline_only") or comparison.get("before_runs") == comparison.get("after_runs")):
+        # compare-runs.py checked the baseline alone (or it against itself): nothing was compared.
+        notes = [f"- Warning: {w}" for w in comparison.get("warnings", [])]
+        return (timing_lines(None, pre) if pre else ["Baseline only; no after runs were compared."]) + notes
     if not comparison and pre:
         ready = med([r.get("first_start_to_ready_s") for r in pre])
         timeouts = sum(sum(r.get("snapshot_timeouts", {}).values()) for r in pre)
@@ -219,23 +232,42 @@ def query_lines(before, after):
         lines.append(f"- {label}: {len(before.get(kind, []))}, {b} ms in total" + (f" → {total(after, kind)} ms" if after else ""))
     meta = before.get("meta", {})
     lines += ["", f"Host timings on {meta.get('host', 'the host')} against {meta.get('rows', '?')} rows; a phone is several times slower."]
-    moved = [r for r in (after or {}).get("comparison", []) if r["verdict"] != "same"]
-    if after:
-        lines.append(f"\n{sum(r['verdict'] == 'faster' for r in moved)} faster, {sum(r['verdict'] == 'SLOWER' for r in moved)} slower, "
-                     f"{len(after.get('comparison', [])) - len(moved)} the same.")
-        rows = moved[:12]
-        head = "| What | Where | Before | After | Change |"
-        body = [f"| {KIND[r['kind']]} | `{r['where']}` | {r['before_ms']} ms | {r['after_ms']} ms | {r['change_pct']}% |" for r in rows]
-    else:
+    scale = (after or {}).get("meta", {}).get("scale") or meta.get("scale")
+    blocks = [("", (after or {}).get("comparison", []))]
+    if (after or {}).get("comparisonScaled"):
+        blocks.append((f" at {scale}x data", after["comparisonScaled"]))
+    rewritten = False
+    for at, compared in blocks if after else []:
+        moved = [r for r in compared if r["verdict"] != "same"]
+        slower = sum(r["verdict"] == "SLOWER" for r in moved)
+        lines.append(f"\n{'**' if slower else ''}Before and after{at}: {sum(r['verdict'] == 'faster' for r in moved)} faster, "
+                     f"{slower} slower, {len(compared) - len(moved)} the same.{'**' if slower else ''}")
+        rows = [r for r in moved if r["verdict"] == "SLOWER"] + [r for r in moved if r["verdict"] != "SLOWER"]
+        if rows:
+            lines += ["", "| What | Where | Before | After | Change | |", "| --- | --- | ---: | ---: | ---: | --- |"]
+            for r in rows[:12]:
+                note = r["verdict"]
+                if r.get("rewritten") and r["verdict"] == "SLOWER":
+                    note, rewritten = "SLOWER (query rewritten)", True
+                lines.append(f"| {KIND[r['kind']]} | `{r['where']}` | {r['before_ms']} ms | {r['after_ms']} ms | {r['change_pct']}% | {note} |")
+    if rewritten:
+        lines += ["", "Query rewritten: its text changed between the two runs. When the new query does work that expressions "
+                      "did per row before, the before time left that work out (expressions cannot be timed here), so the two "
+                      "times are not like for like: judge the change by the screen time, and fix what the plan shows (a missing index)."]
+    if after and (before.get("growth") or after.get("growth")) and not after.get("comparisonScaled"):
+        lines += ["", "The scaled data was not compared before and after (run time-queries.mjs with the same --scale on both "
+                      "sides and --baseline on the second): a regression that shows only with more data would be missed."]
+    if not after:
         rows = sorted([dict(r, kind=k) for k in ("queries", "actions") for r in before.get(k, []) if r.get("ms") is not None],
                       key=lambda r: -r["ms"])[:8]
-        head = "| What | Where | Median | Rows |"
-        body = [f"| {KIND[r['kind']]} | `{r['where']}` | {r['ms']} ms | {r.get('rows', '-')} |" for r in rows]
-    if rows:
-        lines += ["", head, "| --- | --- | ---: | ---: |" + (" ---: |" if after else "")] + body
+        if rows:
+            lines += ["", "| What | Where | Median | Rows |", "| --- | --- | ---: | ---: |"]
+            lines += [f"| {KIND[r['kind']]} | `{r['where']}` | {r['ms']} ms | {r.get('rows', '-')} |" for r in rows]
     grow = [r for r in before.get("growth", []) if r["verdict"] == "GROWS FASTER"]
     if before.get("growth"):
-        lines += ["", f"**At {meta.get('scale', 10)}x data: {len(grow)} grow faster than the data.**"]
+        grow_after = [r for r in (after or {}).get("growth", []) if r["verdict"] == "GROWS FASTER"] if (after or {}).get("growth") else None
+        lines += ["", f"**At {meta.get('scale', 10)}x data: {len(grow)} grow faster than the data"
+                      + (f" before, {len(grow_after)} after" if grow_after is not None else "") + ".**"]
         if grow:
             lines += ["", "| What | Where | 1x | Scaled | Time |", "| --- | --- | ---: | ---: | ---: |"]
             lines += [f"| {KIND[r['kind']]} | `{r['where']}` | {r['ms_1x']} ms | {r['ms_nx']} ms | {r.get('time_x')}x |" for r in grow[:10]]
@@ -263,11 +295,11 @@ def counts(static):
     return f"{pri.get('high', 0)} high · {pri.get('medium', 0)} medium" + (f" (+{safety} expression safety)" if safety else "")
 
 
-def overview(folder, pre, post, timings_before, timings_after, screens, static_before, static_after):
+def overview(folder, pre, post, skip_android, timings_before, timings_after, screens, static_before, static_after):
     """One row per area: the number that matters before, after, and where to look."""
     fmt_s = lambda v: "-" if v is None else f"{v} s"
     rows = []
-    for label, p, q in (("Sync, time to ready", pre, post), ("Sync on Android", load_runs(folder, "pre-android"), load_runs(folder, "post-android"))):
+    for label, p, q in (("Sync, time to ready", pre, post), ("Sync on Android", load_runs(folder, "pre-android", skip_android), load_runs(folder, "post-android", skip_android))):
         if p:
             b, a = med([r.get("first_start_to_ready_s") for r in p]), med([r.get("first_start_to_ready_s") for r in q]) if q else None
             def slowest_fn(runs):
@@ -289,8 +321,10 @@ def overview(folder, pre, post, timings_before, timings_after, screens, static_b
                     return ""
                 top = slowest(t, kind)
                 grow = sum(1 for r in t.get("growth", []) if r["kind"] == kind and r["verdict"] == "GROWS FASTER")
+                slower = sum(1 for r in t.get("comparisonScaled", []) if r["kind"] == kind and r["verdict"] == "SLOWER")
                 return "; ".join(x for x in (f"slowest: `{top['where']}` {top['ms']} ms" if top else "",
-                                             f"{grow} grow faster than the data" if grow else "") if x)
+                                             f"{grow} grow faster than the data" if grow else "",
+                                             f"**{slower} slower at {t.get('meta', {}).get('scale', 'scaled')}x data**" if slower else "") if x)
             rows.append((f"{label}, {len(timings_before.get(kind, []))} in total", f"{tot(timings_before)} ms",
                          f"{tot(timings_after)} ms" if timings_after else "-", look(where(timings_before), where(timings_after), bool(timings_after))))
     for label, (p, q) in screens.items():
@@ -339,7 +373,7 @@ def screen_lines(pre, post):
                         "ready element, not what loads after it. unclear: the medians moved but the runs overlap; read the runs."]
 
 
-def report(folder, solution=None, timings=(None, None)):
+def report(folder, solution=None, timings=(None, None), exclude=()):
     before = findings(read(folder, "before", "static.json"), read(folder, "before", "plans.json"))
     after_static, after_plans = read(folder, "after", "static.json"), read(folder, "after", "plans.json")
     after = findings(after_static, after_plans) if (after_static or after_plans) else None
@@ -350,9 +384,13 @@ def report(folder, solution=None, timings=(None, None)):
     timings_before = read_path(timings[0]) if timings[0] else read(folder, "before", "timings.json")
     timings_after = read_path(timings[1]) if timings[1] else read(folder, "after", "timings.json")
     screens_pre, screens_post = read(folder, "screens", "pre.json"), read(folder, "screens", "post.json")
-    pre, post = load_runs(folder, "pre"), load_runs(folder, "post")
+    # The runs compare-runs.py left out stay out here, or the two would show different medians.
+    skip = set(exclude) | set((comparison or {}).get("excluded", []))
+    android_sync = read(folder, "runs", "comparison-android.json")
+    skip_android = set(exclude) | set((android_sync or {}).get("excluded", []))
+    pre, post = load_runs(folder, "pre", skip), load_runs(folder, "post", skip)
     android_screens = (read(folder, "screens", "pre-android.json"), read(folder, "screens", "post-android.json"))
-    lines += overview(folder, pre, post, timings_before, timings_after,
+    lines += overview(folder, pre, post, skip_android, timings_before, timings_after,
                       {"Screen": (screens_pre, screens_post), "Android screen": android_screens},
                       read(folder, "before", "static.json"), after_static)
     lines += ["## Sync", ""] + timing_lines(comparison, pre) + [""]
@@ -360,12 +398,11 @@ def report(folder, solution=None, timings=(None, None)):
     lines += ["## Queries and actions", ""] + query_lines(timings_before, timings_after) + [""]
     lines += ["## Screens", ""] + screen_lines(screens_pre, screens_post) + [""]
     # Android, when it was timed too (track-load.py --android, time-screens.py --platform android).
-    android_sync = read(folder, "runs", "comparison-android.json")
     android_pre, android_post = read(folder, "screens", "pre-android.json"), read(folder, "screens", "post-android.json")
-    android_pre_runs = load_runs(folder, "pre-android")
+    android_pre_runs = load_runs(folder, "pre-android", skip_android)
     if android_sync or android_pre_runs:
         lines += ["## Sync (Android)", ""] + timing_lines(android_sync, android_pre_runs) + [""]
-        lines += ["## Functions (Android)", ""] + function_lines(android_pre_runs, load_runs(folder, "post-android")) + [""]
+        lines += ["## Functions (Android)", ""] + function_lines(android_pre_runs, load_runs(folder, "post-android", skip_android)) + [""]
     if android_pre:
         lines += ["## Screens (Android)", ""] + screen_lines(android_pre, android_post) + [""]
     lines += ["## Findings by section", ""]
@@ -401,10 +438,14 @@ def report(folder, solution=None, timings=(None, None)):
     lines += ["## Not verified", "",
               "- Simulator timings show relative change on that machine, not timings on a customer's device.",
               "- Confirm large wins on the slowest supported device with production-sized data."]
-    if not comparison:
+    if skip | skip_android:
+        lines.append(f"- Runs left out of every median: {', '.join(sorted(skip | skip_android))}.")
+    if not comparison or comparison.get("baseline_only"):
         lines.append("- No before/after load timing was recorded.")
     if not timings_after:
         lines.append("- Query and action times were not compared before and after.")
+    elif (timings_before or {}).get("growth") and not timings_after.get("comparisonScaled"):
+        lines.append("- Query times at the scaled data were not compared before and after.")
     if not (screens_post and screens_post.get("comparison")):
         lines.append("- Screen open times were not compared before and after.")
     lines.append("- Expressions have no runtime timing; their cost shows only inside screen open time.")
@@ -417,10 +458,27 @@ def main(argv=None):
     p.add_argument("--solution")
     p.add_argument("--timings", nargs=2, metavar=("BEFORE", "AFTER"),
                    help="time-queries.mjs JSON files to use instead of before/ and after/timings.json")
+    p.add_argument("--exclude", action="append", default=[], metavar="LABEL",
+                   help="run label to leave out, besides the ones compare-runs.py left out; repeat it, or separate with commas")
+    p.add_argument("--change", metavar='"B: what changed"', help="append one change to changes.json (section letter A-H first) and exit")
+    p.add_argument("--files", nargs="*", default=[], help="with --change: the files it touched")
     args = p.parse_args(argv)
+    if args.change:
+        m = re.match(r"\s*([A-Ha-h])\s*[:.)-]\s*(.+)", args.change, re.S)
+        if not m:
+            p.error('--change needs the section letter first, e.g. --change "F: skip the focus sync right after a sync" '
+                    f"({', '.join(f'{k} {v}' for k, v in SECTIONS.items())})")
+        path = os.path.join(args.folder, "changes.json")
+        changes = read(args.folder, "changes.json") or []
+        changes.append({"section": m.group(1).upper(), "change": m.group(2).strip(), **({"files": args.files} if args.files else {})})
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(changes, f, indent=2)
+        print(f"{path}: {len(changes)} change(s); added to {m.group(1).upper()} {SECTIONS[m.group(1).upper()]}")
+        return 0
     if not any(os.path.exists(os.path.join(args.folder, "before", n)) for n in ("static.json", "audit.json")):
         p.error(f"{args.folder}/before/static.json is missing; capture the baseline first")
-    text = report(args.folder, args.solution, tuple(args.timings or (None, None)))
+    skip = [x.strip() for value in args.exclude for x in value.split(",") if x.strip()]
+    text = report(args.folder, args.solution, tuple(args.timings or (None, None)), skip)
     with open(os.path.join(args.folder, "report.md"), "w", encoding="utf-8") as f:
         f.write(text)
     print(text)

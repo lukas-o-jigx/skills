@@ -649,3 +649,252 @@ class ProjectCentralRerunTest(unittest.TestCase):
 
 
 from contextlib import closing as contextlib_closing  # noqa: E402
+
+
+class EndToEndRerunTest(unittest.TestCase):
+    """Peter's end-to-end rerun of Project Central and Time-Tracking-V2 (13 Nov 2026)."""
+    SOL = "8a00cc3c-6c1c-40ca-8439-81c9ead89754"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.folder = os.path.join(self.dir, "Library", "LocalDatabase")
+        os.makedirs(self.folder)
+        self.db = os.path.join(self.folder, f"jigx.solution.___project-central-dev___.{self.SOL}.db")
+        conn = sqlite3.connect(self.db)
+        conn.execute("CREATE TABLE _syncScope (id TEXT PRIMARY KEY, state TEXT, details TEXT, lastStartedAt INTEGER, lastSyncedAt INTEGER)")
+        conn.execute("CREATE TABLE _commandQueue (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO _syncScope VALUES ('main', 'synced', '{}', 1, 2)")
+        conn.commit(); conn.close()
+        log = sqlite3.connect(os.path.join(self.folder, "jigx.log.db"))
+        log.execute("CREATE TABLE _logMessages (id INTEGER PRIMARY KEY, timestamp INTEGER, state TEXT, message TEXT)")
+        log.commit(); log.close()
+        self.runs = os.path.join(self.dir, "review", "runs")
+        os.makedirs(self.runs)
+        os.makedirs(os.path.join(self.dir, "review", "before"))
+
+    def tearDown(self):
+        shutil.rmtree(self.dir)
+
+    def save_state(self, state, in_file=False):
+        """The app's AsyncStorage as React Native writes it: persist:solution inline, or in its own file."""
+        store = os.path.join(self.dir, "Library", "Application Support", "com.jigx.frontline", "RCTAsyncLocalStorage_V1")
+        os.makedirs(store, exist_ok=True)
+        value = json.dumps({"instances": json.dumps({"other-id": {"state": {"x": 1}}, self.SOL.upper(): {"state": state}}),
+                            "_persist": json.dumps({"version": 1})})
+        if in_file:
+            import hashlib
+            with open(os.path.join(store, hashlib.md5(b"persist:solution").hexdigest()), "w") as f:
+                f.write(value)
+        with open(os.path.join(store, "manifest.json"), "w") as f:
+            json.dump({"persist:solution": None if in_file else value, "jigx-icon--add": "<svg/>"}, f)
+
+    def write_runs(self, runs):
+        for r in runs:
+            with open(os.path.join(self.runs, f"{r['label']}-summary.json"), "w") as f:
+                json.dump(r, f)
+
+    def quiet(self, fn, *args):
+        import contextlib as _c
+        out = io.StringIO()
+        with _c.redirect_stdout(out):
+            code = fn(*args)
+        return code, out.getvalue()
+
+    # 3. scope times kept the login page: sync-appointments 40.2 s in a run whose total was 11.7 s
+    def test_a_scope_that_waited_for_another_scopes_login_page_does_not_count_the_wait(self):
+        def sample(t, identity, data):
+            return {"t": t, "queue": 0, "counts": {}, "scopes": {
+                "identity": {"state": identity[0], "startedAt": identity[1], "syncedAt": identity[2], "entries": {}},
+                "data": {"state": data[0], "startedAt": data[1], "syncedAt": data[2], "entries": {}}}}
+        samples = [sample(1.0, ("syncing", 1000, None), ("syncing", 1500, None)),
+                   sample(2.0, ("interrupted", 1000, None), ("syncing", 1500, None)),   # the login page, 10 s
+                   sample(12.0, ("syncing", 12000, None), ("syncing", 1500, None)),
+                   sample(13.0, ("synced", 12000, 13000), ("syncing", 1500, None)),
+                   sample(14.0, ("synced", 12000, 13000), ("synced", 1500, 14000))]
+        s = tl.summarise("pre-1", "x.db", samples, "ready", 0, 14000, [], samples[-1], ["identity", "data"])
+        self.assertEqual(s["first_start_to_ready_s"], 3.0)
+        self.assertEqual(s["scopes"]["data"]["duration_s"], 2.5)        # 12.5 s with the login page
+        self.assertEqual(s["scopes"]["data"]["first_duration_s"], 2.5)
+        self.assertLessEqual(s["scopes"]["data"]["duration_s"], s["first_start_to_ready_s"])
+
+    # 5. the warm-up run on a freshly installed app was not marked
+    @unittest.skipUnless(hasattr(os.stat(os.curdir), "st_birthtime"), "needs a file creation time (macOS, where the iOS Simulator runs)")
+    def test_first_sign_in_is_known_by_the_database_it_created_not_by_the_age_of_the_install(self):
+        armed = int(time.time() * 1000) + 500
+        # No container path to date, an app installed any time ago: the sign-in created this database.
+        self.assertTrue(tl.first_sign_in_after_install(self.db, armed))
+        self.assertFalse(tl.first_sign_in_after_install(self.db, armed + 3600 * 1000))  # signed in an hour before arming
+        with contextlib_closing(sqlite3.connect(os.path.join(self.folder, "jigx.log.db"))) as log:
+            log.execute("INSERT INTO _logMessages (timestamp, state, message) VALUES (?, 'read', ?)",
+                        (armed - 100, json.dumps({"level": "INFO", "message": "Signing out"})))
+            log.commit()
+        self.assertFalse(tl.first_sign_in_after_install(self.db, armed))
+
+    # 9. a run with no sign-in waited the whole --timeout, then printed "Sync busy Nones"
+    def test_a_run_nobody_starts_stops_early_and_prints_no_none(self):
+        out = io.StringIO()
+        began = time.time()
+        s = tl.track(self.db, "post-2", self.runs, interval=0.02, settle=0.1, timeout=30, stream=out, start_timeout=0.2)
+        self.assertLess(time.time() - began, 5)
+        self.assertEqual(s["result"], "timeout")
+        self.assertEqual(s["timeout_reason"], "no sign-out seen and nothing started in 0.2 s")
+        self.assertIn("Nothing started in 0.2 s", out.getvalue())
+        self.assertNotIn("None", out.getvalue())
+
+    # 6. a when: guard that did not hold could only be seen by reading AsyncStorage by hand
+    def test_solution_state_is_read_from_the_apps_storage_and_saved_at_each_scope_start(self):
+        self.assertIsNone(tl.solution_state(self.db))  # nothing saved yet
+        state = {"active-project": "BUDGETBYM ", "sync-complete": False, "apiToken": "abc.def", "note": "x" * 300}
+        for in_file in (False, True):
+            self.save_state(state, in_file)
+            got = tl.solution_state(self.db)
+            self.assertEqual(got["active-project"], "BUDGETBYM ")   # padding kept
+            self.assertIs(got["sync-complete"], False)
+            self.assertEqual(got["apiToken"], "***")
+            self.assertEqual(len(got["note"]), 121)
+            self.assertEqual(len(tl.solution_state(self.db, full=True)["note"]), 300)
+        self.assertIsNone(tl.solution_state("adb:emulator-5554:/data/x.db"))
+
+        def drive():
+            time.sleep(0.1)
+            now = lambda: int(time.time() * 1000)
+            conn = sqlite3.connect(self.db)
+            for state_, started, done in (("syncing", now(), None), ("synced", None, True)):
+                if started:
+                    self.started = started
+                conn.execute("UPDATE _syncScope SET state=?, lastStartedAt=?, lastSyncedAt=?", (state_, self.started, now() if done else None))
+                conn.commit()
+                time.sleep(0.15)
+            self.save_state(dict(state, **{"sync-complete": True}))
+            self.started = now()
+            conn.execute("UPDATE _syncScope SET state='syncing', lastStartedAt=?", (self.started,)); conn.commit()   # the focus sync
+            time.sleep(0.15)
+            conn.execute("UPDATE _syncScope SET state='synced', lastSyncedAt=?", (now(),)); conn.commit()
+            conn.close()
+        worker = threading.Thread(target=drive); worker.start()
+        out = io.StringIO()
+        s = tl.track(self.db, "pre-1", self.runs, scopes=["main"], interval=0.02, settle=0.6, timeout=10, stream=out)
+        worker.join()
+        log = s["state_at_scope_start"]
+        self.assertEqual([x["scope"] for x in log], ["main", "main"])
+        self.assertIs(log[0]["state"]["sync-complete"], False)
+        self.assertIs(log[1]["state"]["sync-complete"], True)
+        self.assertEqual(s["repeated_scopes"], ["main"])
+        self.assertIn("solution state at its second start", out.getvalue())
+        self.assertIn('"sync-complete"=true'.replace('"', ''), out.getvalue().replace('"', ''))
+        self.assertNotIn("abc.def", out.getvalue() + json.dumps(s))
+
+    # 4. "not like the others" fired on every run of a simulator that holds 25 solutions
+    def test_other_solutions_on_every_run_are_said_once_and_only_the_real_outlier_is_named(self):
+        others = ["time-tracking-v2", "expenses", "field-services", "sales"]
+        mk = lambda label, total: dict(run(label, total, 3), other_solutions_synced=others)
+        pre = [mk("pre-1", 11.0), mk("pre-2", 13.7), mk("pre-3", 13.7), mk("pre-4", 40.2)]
+        post = [mk("post-1", 8.4), mk("post-2", 8.1), mk("post-3", 11.0)]
+        warnings = cr.compare(pre, post)["warnings"]
+        odd = [w for w in warnings if "not like the others" in w]
+        self.assertEqual(len(odd), 1)
+        self.assertIn("before run pre-4 is not like the others (40.2s against 11, 13.7, 13.7 for the others)", odd[0])
+        shared = [w for w in warnings if w.startswith("other solutions on this device synced during 7 of 7 runs")]
+        self.assertEqual(len(shared), 1)
+        self.assertIn("(expenses, field-services, sales and 1 more)", shared[0])
+        # one run with another solution syncing, the rest without: that run is still named
+        pre2 = [run("pre-1", 11.0, 3), run("pre-2", 13.7, 3), dict(run("pre-3", 13.7, 3), other_solutions_synced=["sales"])]
+        self.assertIn("before run pre-3 is not like the others (sales synced during it)", " ".join(cr.compare(pre2, post[:0] or [run("post-1", 9, 3)])["warnings"]))
+
+    # 2. the login page was missed in 2 of 9 sign-ins: password typing timed as sync
+    def test_a_run_without_the_login_pause_the_others_had_is_named(self):
+        def mk(label, total, identity, paused):
+            return dict(run(label, total, 3), interrupted_s=paused, entries={"sync-identity/whoami": {"duration_s": identity},
+                                                                              "sync-base/a": {"duration_s": 3}})
+        pre = [mk("pre-1", 11.0, 3.0, 12.4), mk("pre-2", 13.7, 3.2, 9.8), mk("pre-3", 24.5, 17.2, 0), mk("pre-4", 13.7, 2.9, 15.0)]
+        post = [mk("post-1", 8.4, 3.1, 11.0), mk("post-2", 8.1, 3.0, 10.2), mk("post-3", 11.0, 3.3, 14.1)]
+        odd = [w for w in cr.compare(pre, post)["warnings"] if "not like the others" in w]
+        self.assertEqual(len(odd), 1)  # 24.5 s is not twice the others, so only these two signs name it
+        self.assertIn("before run pre-3", odd[0])
+        self.assertIn("no login page pause was seen in it, but in the other runs: typing the password was probably timed as sync", odd[0])
+        self.assertIn("sync-identity/whoami took 17.2s against 3s in the other runs", odd[0])
+        # a solution with no login page at all: nothing to say
+        plain = [mk(f"pre-{i}", 11.0, 3.0, 0) for i in range(3)]
+        self.assertEqual([w for w in cr.compare(plain, [dict(r, label=r["label"].replace("pre", "post")) for r in plain])["warnings"] if "login page" in w], [])
+
+    # 7, 8, 12. the baseline alone, --exclude twice, and a report that compared the baseline with itself
+    def test_baseline_alone_and_repeated_exclude(self):
+        self.write_runs([run("pre-0", 30.0, 5), run("pre-1", 29.0, 5), run("pre-2", 5.8, 5), run("pre-3", 5.79, 5), run("pre-4", 5.78, 5)])
+        code, text = self.quiet(cr.main, [self.runs, "--exclude", "pre-0", "--exclude", "pre-1"])
+        self.assertEqual(code, 0)
+        self.assertIn("# Load baseline", text)
+        self.assertIn("| total: first start to ready | 5.79 | 5.8, 5.79, 5.78 |", text)
+        with open(os.path.join(self.runs, "comparison.json")) as f:
+            saved = json.load(f)
+        self.assertTrue(saved["baseline_only"])
+        self.assertEqual(saved["excluded"], ["pre-0", "pre-1"])
+        self.assertEqual(saved["before_runs"], ["pre-2", "pre-3", "pre-4"])
+        for args in (["--before", "pre", "--after", "pre"], ["--exclude", "pre-0,pre-1"]):  # the old workaround, and the comma form
+            code, text = self.quiet(cr.main, [self.runs, "--exclude", "pre-0,pre-1", *args])
+            self.assertIn("# Load baseline", text)
+        with open(os.path.join(self.dir, "review", "before", "static.json"), "w") as f:
+            json.dump({"byCode": {}}, f)
+        report = rr.report(os.path.join(self.dir, "review"), "demo")
+        self.assertIn("**Time to ready: 5.79 s** (median of 3 run(s)", report)
+        self.assertNotIn("→ 5.79", report)
+        self.assertNotIn("same", report.split("## Functions")[0].split("## Sync")[1])
+        self.assertIn("Warning: left out: pre-0, pre-1", report)
+        self.assertIn("No before/after load timing was recorded", report)
+
+    # 10. the report read every summary: 13.68 -> 9.71 s where the comparison said 8.42 s
+    def test_the_report_leaves_out_the_runs_the_comparison_left_out(self):
+        self.write_runs([run("pre-0", 24.9, 5), run("pre-1", 24.5, 5), run("pre-2", 11.04, 5), run("pre-3", 13.71, 5), run("pre-4", 13.68, 5),
+                         run("post-1", 24.5, 5), run("post-2", 8.42, 2), run("post-3", 8.11, 2), run("post-4", 10.99, 2)])
+        self.quiet(cr.main, [self.runs, "--exclude", "pre-0,pre-1", "--exclude", "post-1"])
+        with open(os.path.join(self.dir, "review", "before", "static.json"), "w") as f:
+            json.dump({"byCode": {}}, f)
+        review = os.path.join(self.dir, "review")
+        report = rr.report(review, "demo")
+        self.assertIn("**Time to ready: 13.68 s → 8.42 s (-38.5%, improved)**", report)
+        self.assertIn("| Sync, time to ready | 13.68 s | 8.42 s |", report)   # was 9.71 s, the median with post-1
+        self.assertIn("Median of 3 run(s) before and 3 after", report)
+        self.assertIn("Runs left out of every median: post-1, pre-0, pre-1.", report)
+        self.assertIn("| Sync, time to ready | 13.68 s | 8.27 s |", rr.report(review, "demo", exclude=["post-4"]))
+
+    # 11, 13. the 10x comparison, the only place the new regression showed, was dropped
+    def test_the_report_keeps_the_comparison_at_scaled_data(self):
+        review = os.path.join(self.dir, "review")
+        os.makedirs(os.path.join(review, "after"))
+        with open(os.path.join(review, "before", "static.json"), "w") as f:
+            json.dump({"byCode": {}}, f)
+        row = {"kind": "queries", "where": "datasources/photologsdata", "ms_1x": 0.1, "ms_nx": 0.1, "time_x": 1, "verdict": "in line"}
+        with open(os.path.join(review, "before", "timings.json"), "w") as f:
+            json.dump({"meta": {"host": "M4", "rows": 900, "scale": 10}, "queries": [{"where": "datasources/photologsdata", "ms": 0.1}],
+                       "actions": [], "indexes": [], "growth": [row]}, f)
+        after = {"meta": {"host": "M4", "rows": 900, "scale": 10}, "queries": [{"where": "datasources/photologsdata", "ms": 0.2}],
+                 "actions": [], "indexes": [], "growth": [dict(row, ms_nx=9.3)],
+                 "comparison": [{"kind": "queries", "where": "datasources/photologsdata", "before_ms": 0.1, "after_ms": 0.2, "change_pct": 100, "verdict": "same"}]}
+        with open(os.path.join(review, "after", "timings.json"), "w") as f:
+            json.dump(after, f)
+        self.assertIn("The scaled data was not compared before and after", rr.report(review))
+        after["comparisonScaled"] = [{"kind": "queries", "where": "datasources/photologsdata", "before_ms": 0.1, "after_ms": 9.3,
+                                      "change_pct": 9200, "verdict": "SLOWER", "rewritten": True}]
+        with open(os.path.join(review, "after", "timings.json"), "w") as f:
+            json.dump(after, f)
+        text = rr.report(review)
+        self.assertIn("Before and after: 0 faster, 0 slower, 1 the same.", text)
+        self.assertIn("**Before and after at 10x data: 0 faster, 1 slower, 0 the same.**", text)
+        self.assertIn("| query | `datasources/photologsdata` | 0.1 ms | 9.3 ms | 9200% | SLOWER (query rewritten) |", text)
+        self.assertIn("the before time left that work out", text)
+        self.assertIn("**1 slower at 10x data**", text)   # the overview row
+        self.assertNotIn("were not compared before and after", text.split("## Not verified")[1].split("Screen open")[0])
+
+    # 14. changes.json was written by hand
+    def test_a_change_is_appended_with_its_section(self):
+        review = os.path.join(self.dir, "review")
+        self.quiet(rr.main, [review, "--change", "F: skip the focus sync right after a sync", "--files", "jigs/a.jigx", "jigs/b.jigx"])
+        self.quiet(rr.main, [review, "--change", "b. TRIM() indexes for the time-activities join"])
+        with open(os.path.join(review, "changes.json")) as f:
+            self.assertEqual(json.load(f), [
+                {"section": "F", "change": "skip the focus sync right after a sync", "files": ["jigs/a.jigx", "jigs/b.jigx"]},
+                {"section": "B", "change": "TRIM() indexes for the time-activities join"}])
+        with self.assertRaises(SystemExit), contextlib_redirect_stderr(io.StringIO()):
+            rr.main([review, "--change", "no section letter"])
+
+
+from contextlib import redirect_stderr as contextlib_redirect_stderr  # noqa: E402
