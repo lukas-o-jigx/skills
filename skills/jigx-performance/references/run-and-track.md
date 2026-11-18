@@ -148,20 +148,32 @@ use.
    - The runtime log is shared by every solution in the app: lines another solution wrote
      (its snapshot timeouts, its errors) are left out. The first sign-in after installing
      the app is marked (`first_sign_in_after_install`: the sign-in that created the
-     solution database, with no sign-out before it), as is a run during which another
+     solution database, with no sign-out before it; a database that was there when
+     tracking started, or a sign-out the tracker saw, rules it out, and when several
+     runs carry the mark only the earliest is named), as is a run during which another
      solution synced; `compare-runs.py` names those and any run over twice the others on
      its side, and `--exclude <label>` (repeatable, or comma-separated) leaves one out. Run
      it again rather than keep it. On a device that holds many solutions every sign-in
      syncs them, so that is said once for all runs and no run is singled out for it.
    - The login page: the time any scope is `interrupted` is taken out of the total and of
-     every scope and entry time. The runtime does not always report the pause (seen in 2
-     of 9 sign-ins): `compare-runs.py` then names the run, because the others paused and
-     it did not, or because one call took at least three times and 5 s longer than in the
-     others. Such a run timed the password typing; run it again.
+     every scope and entry time. The app can restart the whole sync while the page is
+     open (every scope gets a new start and the identity scope reads `syncing`): the
+     pause then lasts until the last restart before anything synced, those restarts are
+     the same sync and not repeats, and a scope that only waited through them is timed
+     from the start it worked in. A run where the runtime never reports `interrupted`
+     cannot be corrected, since nothing in the database or the log marks the login page
+     (seen in about 1 sign-in in 8): `compare-runs.py` names it, because the others
+     paused and it did not, or because one call took at least three times and 5 s longer
+     than in the others. Such a run timed the password typing; run it again.
+   - `--source <solution folder>`: a scope that syncs more than once in the run is
+     reported with the `onFocus`, `onLoad`, `onRefresh` or `onTableChange` in the source
+     that starts it (`repeat_starters` in the summary, read from the file text, so a
+     pointer to look at); the report repeats it.
    - Nothing started within `--start-timeout` (300 s by default, counted from arming or
      from the sign-out): the run stops there instead of waiting out `--timeout`.
    - `state_at_scope_start` in the summary is the solution state at every scope start (iOS
-     Simulator; the app keeps it in its AsyncStorage, not in the database), and
+     Simulator; the app keeps it in its AsyncStorage, not in the database: under
+     `jigx.solution-state` from app 3.12, `persist:solution` before), and
      `--state` prints it now: what a `when:` guard read when a sync that should have been
      skipped started anyway.
    - Time from the first scope start, not from arming: the wait before it includes the

@@ -234,6 +234,21 @@ class TimeScreensTest(unittest.TestCase):
         self.assertEqual(ts.maestro_failure("", 1), "maestro exited 1")
         self.assertEqual(ts.maestro_failure("a\nb\nc\nd", 1), "b / c / d")
 
+    def test_a_screen_with_no_after_steps_is_left_by_restarting_the_app(self):
+        # Peter's retest: --ids --at a screen with no after steps only warned; the next call's prepare failed
+        text = ts.restart_flow("com.jigx.app")
+        self.assertLess(text.index("- stopApp"), text.index("- launchApp:"))
+        self.assertTrue(text.startswith("appId: com.jigx.app\n---\n"))
+
+    def test_the_solutions_log_lines_come_before_the_apps_own(self):
+        # Peter's retest: app 3.12 logs "Reference cycle" 54 times per cold start, with no solution
+        app = [{"level": "ERROR", "message": f"Reference cycle #{i} these nodes read each other"} for i in range(54)]
+        noise = [{"level": "ERROR", "message": f"app line {n}"} for n in "abcdef" for _ in range(3)]
+        mine = [{"level": "WARNING", "message": "Invalid weekStartDay", "solution": "time-tracking"}]
+        top = ts.log_summary([{"log": app + noise + mine}])["top"]
+        self.assertEqual((top[0]["message"], top[0].get("solution")), ("Invalid weekStartDay", "time-tracking"))
+        self.assertEqual(top[1]["count"], 54)
+
 
 if __name__ == "__main__":
     unittest.main()

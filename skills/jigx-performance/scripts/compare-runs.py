@@ -128,10 +128,13 @@ def odd_runs(before, after):
     shared = len(everything) >= 2 and sum(others) > len(everything) / 2  # the device's normal, not a difference
     paused = [r for r in everything if (r.get("interrupted_s") or 0) > 0]
     names = lambda xs: ", ".join(xs[:3]) + (f" and {len(xs) - 3} more" if len(xs) > 3 else "")
+    # An install has one first sign-in: when several runs carry the mark, only the earliest is it.
+    marked = [r for r in everything if r.get("first_sign_in_after_install")]
+    first = min(marked, key=lambda r: r.get("armed_at") or "") if marked else None
     for side, runs in (("before", before),) + ((("after", after),) if after is not before else ()):
         for r in runs:
             why = []
-            if r.get("first_sign_in_after_install"):
+            if r is first:
                 why.append("the first sign-in after installing the app")
             if r.get("other_solutions_synced") and not shared:
                 why.append(f"{names(r['other_solutions_synced'])} synced during it")

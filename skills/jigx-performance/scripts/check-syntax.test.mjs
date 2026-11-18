@@ -67,3 +67,20 @@ test('--jsonata takes the package folder or the project folder that holds node_m
   assert.equal(findJsonata(empty, project)?.version, found.version);
   assert.equal(findJsonata(empty, path.join(project, 'node_modules', 'jsonata'))?.version, found.version);
 });
+
+// Peter's retest: the skill says to run it "on the changed files", but a file alone failed with ENOTDIR and --help with ENOENT.
+test('a changed file alone is checked in the solution above it, index.jigx included, and --help prints the usage', {skip: !found && 'no jsonata package on this machine'}, () => {
+  const dir = solution({'index.jigx': 'name: s\nonFocus:\n  when: =@ctx.system.isOnline and\n',
+    'jigs/deep/a.jigx': 'title: A\ntype: jig.default\nwhen: =$count(@ctx.datasources.file) > 0\n'});
+  const script = fileURLToPath(new URL('./check-syntax.mjs', import.meta.url));
+  const run = (...args) => spawnSync(process.execPath, [script, ...args, '--jsonata', found.dir], {encoding: 'utf8'});
+  const ok = run(path.join(dir, 'jigs/deep/a.jigx'));
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+  assert.match(ok.stdout, /1 file\(s\): 0 YAML error\(s\); 1 expressions parsed/);
+  const bad = run(path.join(dir, 'index.jigx'));
+  assert.equal(bad.status, 1);
+  assert.match(bad.stdout, /JSONata index › onFocus\.when/);
+  const help = spawnSync(process.execPath, [script, '--help'], {encoding: 'utf8'});
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /usage: node check-syntax\.mjs/);
+});

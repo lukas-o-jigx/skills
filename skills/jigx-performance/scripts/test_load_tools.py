@@ -897,4 +897,102 @@ class EndToEndRerunTest(unittest.TestCase):
             rr.main([review, "--change", "no section letter"])
 
 
+class RetestTest(unittest.TestCase):
+    """Peter's retest of fc01ca9 on app 3.12 (18 Nov 2026), from the samples of his two odd sign-ins."""
+    ARMED = 1_000_000
+    DB = "/x/jigx.solution.___project-central-dev___.8a00cc3c-6c1c-40ca-8439-81c9ead89754.db"
+
+    def scope(self, state, started, synced=None, entry=None):
+        return {"state": state, "startedAt": self.ARMED + started, "syncedAt": self.ARMED + synced if synced else None,
+                "entries": {"call": entry or ("synced" if state == "synced" else "syncing" if state == "syncing" else "not started")}}
+
+    def summary(self, rows):
+        samples = [{"t": t, "scopes": {"identity": i, "inventory": inv}, "queue": 0, "counts": {}} for t, i, inv in rows]
+        ready = max(v["syncedAt"] for v in samples[-1]["scopes"].values())
+        return tl.summarise("pre-0", self.DB, samples, "ready", self.ARMED, ready, [], samples[-1], [])
+
+    def test_a_sync_restarted_while_the_login_page_is_open_is_one_sync_and_the_page_is_not_timed(self):
+        # pre-0: interrupted for one sample, then every scope restarted and read "syncing" while the
+        # user typed, then restarted again after the login. It was timed as 22.79 s with 3 starts a scope.
+        sc = self.scope
+        s = self.summary([
+            (4.0, sc("syncing", 4000), sc("not started", 4010)),
+            (8.8, sc("interrupted", 4000), sc("not started", 4010)),
+            (9.0, sc("syncing", 8950), sc("not started", 8960)),          # restarted: the login page is still open
+            (16.8, sc("syncing", 16600), sc("not started", 16610)),       # restarted again: the login is done
+            (17.3, sc("synced", 16600, 17100), sc("syncing", 16610)),
+            (27.0, sc("synced", 16600, 17100), sc("synced", 16610, 26900))])
+        self.assertEqual(s["interrupted_s"], 7.8)                         # 8.8 s to the last restart at 16.6 s
+        self.assertEqual(s["first_start_to_ready_s"], 15.1)               # 22.9 s with the login page
+        self.assertEqual(s["scope_starts"], {"identity": 1, "inventory": 1})
+        self.assertEqual(s["repeated_scopes"], [])
+        # A scope that only waited through the restarts is timed from the start it worked in.
+        self.assertEqual(s["scopes"]["inventory"]["first_duration_s"], s["scopes"]["inventory"]["duration_s"])
+        self.assertEqual(s["scopes"]["inventory"]["duration_s"], 10.29)
+
+    def test_a_scope_that_waited_for_the_login_is_compared_by_the_sync_it_ran(self):
+        # A sign-in whose pause was detected: the comparison still timed the waiting scope's first,
+        # aborted start (2.71 s against 8.38 s in the summary), so a fix to it showed only in the total.
+        sc = self.scope
+        s = self.summary([
+            (1.0, sc("syncing", 1000), sc("not started", 1010)),
+            (3.0, sc("interrupted", 1000), sc("not started", 1010)),
+            (10.0, sc("syncing", 10000), sc("not started", 10010)),
+            (10.5, sc("synced", 10000, 10400), sc("syncing", 10010)),
+            (18.4, sc("synced", 10000, 10400), sc("synced", 10010, 18390))])
+        self.assertEqual(s["scopes"]["inventory"]["duration_s"], 8.38)
+        self.assertEqual(s["scopes"]["inventory"]["first_duration_s"], 8.38)
+        self.assertEqual(s["scope_starts"], {"identity": 1, "inventory": 1})
+        self.assertEqual(cr.metrics([s])["scope: inventory"], [8.38])
+
+    def test_a_scope_that_synced_and_started_again_is_still_a_repeat(self):
+        sc = self.scope
+        s = self.summary([
+            (1.0, sc("syncing", 1000), sc("syncing", 1010)),
+            (2.0, sc("synced", 1000, 1900), sc("synced", 1010, 1950)),
+            (4.0, sc("synced", 1000, 1900), sc("syncing", 3800)),         # an onFocus starts it again
+            (5.0, sc("synced", 1000, 1900), sc("synced", 3800, 4900))])
+        self.assertEqual(s["scope_starts"], {"identity": 1, "inventory": 2})
+        self.assertEqual(s["repeated_scopes"], ["inventory"])
+        self.assertEqual(s["scopes"]["inventory"]["first_duration_s"], 0.94)
+
+    def test_only_one_run_is_the_first_sign_in(self):
+        # Every sign-in creates a new database (a sign-out deletes it), so all 14 runs were marked and
+        # each was "not like the others". What the tracker saw itself settles it without the log.
+        self.assertFalse(tl.first_sign_in_after_install(self.DB, self.ARMED, seen_before=True))
+        runs = [dict(run(f"pre-{i}", 12.0 + i / 10, 5), first_sign_in_after_install=True,
+                     armed_at=f"2026-11-18T12:4{i}:00.000+00:00") for i in range(4)]
+        named = [w for w in cr.baseline(runs)["warnings"] if "first sign-in" in w]
+        self.assertEqual(len(named), 1)
+        self.assertIn("before run pre-0 is not like the others", named[0])
+
+    def test_solution_state_is_read_from_where_app_3_12_keeps_it(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        sol = "8a00cc3c-6c1c-40ca-8439-81c9ead89754"
+        db = os.path.join(d, "Library", "LocalDatabase", f"jigx.solution.___project-central-dev___.{sol}.db")
+        store = os.path.join(d, "Library", "Application Support", "com.jigx.frontline", "RCTAsyncLocalStorage_V1")
+        os.makedirs(store)
+        value = json.dumps({"version": 1, "solutions": {"other": {"x": 1}, sol: {"active-project": 4711, "initialSyncComplete": True}}})
+        with open(os.path.join(store, "manifest.json"), "w") as f:
+            json.dump({"jigx.solution-state": value, "persist:solution": json.dumps({"_persist": "{}"})}, f)
+        self.assertEqual(tl.solution_state(db), {"active-project": 4711, "initialSyncComplete": True})
+
+    def test_a_repeat_sync_is_named_with_the_screen_event_that_starts_it(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        files = {"actions/act-sync-time.jigx": "action:\n  type: action.sync-entities\n  options:\n    instanceId: sync-time\n",
+                 "jigs/my-day.jigx": "title: My Day\nonFocus:\n  type: action.execute-action\n  options:\n    action: act-sync-time\n"
+                                     "onRefresh:\n  type: action.go-back\n",
+                 "jigs/other.jigx": "title: Other\nonFocus:\n  type: action.execute-action\n  options:\n    action: act-sync-time-off\n",
+                 "src/screens/timecards.ts": "export const timecards = {\n  onFocus: {\n    type: 'action.sync-entities',\n"
+                                             "    options: {instanceId: 'sync-time'},\n  },\n}\n"}
+        for name, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(d, name)), exist_ok=True)
+            with open(os.path.join(d, name), "w") as f:
+                f.write(text)
+        self.assertEqual(tl.sync_starters(d, "sync-time"), ["jigs/my-day.jigx:2 onFocus", "src/screens/timecards.ts:2 onFocus"])
+        self.assertEqual(tl.sync_starters(d, "sync-nothing"), [])
+
+
 from contextlib import redirect_stderr as contextlib_redirect_stderr  # noqa: E402

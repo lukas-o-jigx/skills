@@ -171,11 +171,13 @@ def timing_lines(comparison, pre=None):
         busy = med([r.get("sync_busy_s") for r in pre])
         starts = med([sum(r["scope_starts"].values()) for r in pre if "scope_starts" in r])
         repeated = sorted({sid for r in pre for sid in r.get("repeated_scopes", [])})
+        starters = sorted({x for r in pre for xs in (r.get("repeat_starters") or {}).values() for x in xs})
         lines = [f"**Time to ready: {ready} s** (median of {len(pre)} run(s) on {pre[0].get('machine', '?')})", ""]
         if busy is not None:
             lines += [f"Sync work, also after ready: {busy} s in {starts} scope start(s)."
-                      + (f" **{', '.join(repeated)} synced more than once in a run**: look for an onFocus or onLoad "
-                         "starting the same sync again." if repeated else ""), ""]
+                      + (f" **{', '.join(repeated)} synced more than once in a run**: "
+                         + (f"the source starts the sync from {', '.join(starters)}." if starters
+                            else "look for an onFocus or onLoad starting the same sync again.") if repeated else ""), ""]
         return lines + [
                 f"Timeout for first snapshot: {timeouts}. Runtime log errors: {sum(r.get('log_errors', 0) for r in pre)}. "
                 f"Expression errors: {sum(e['count'] for r in pre for e in r.get('expression_errors', []))}. "

@@ -238,6 +238,12 @@ def after_flow(app_id, screen, platform="ios"):
     return "\n".join(lines) + "\n"
 
 
+def restart_flow(app_id):
+    """Stop the app and start it again: back on its start screen, whatever screen it was left on."""
+    return "\n".join([f"appId: {app_id}", "---", "- stopApp", "- launchApp:", "    stopApp: false",
+                      "- waitForAnimationToEnd:", f"    timeout: {SETTLE_MS}"]) + "\n"
+
+
 def maestro_failure(text, code=None):
     """The step Maestro failed on, from its output: the line that names it, else the last lines."""
     failed = re.findall(r"[^\n]*(?:\.\.\. FAILED|Assertion is false|Element not found|not found within)[^\n]*", text or "")
@@ -395,7 +401,8 @@ def log_summary(runs):
         for line in lines:
             key = (line["level"], re.sub(r"#\d+ ", "", line["message"]), line.get("solution"), line.get("screen"), line.get("expression"))
             counts[key] = counts.get(key, 0) + 1
-    top = sorted(counts.items(), key=lambda kv: (kv[0][0] != "ERROR", -kv[1]))[:6]
+    # The solution's own lines first: an app-level line repeated 50 times (no solution) would fill the list.
+    top = sorted(counts.items(), key=lambda kv: (kv[0][2] is None, kv[0][0] != "ERROR", -kv[1]))[:6]
     return {"runs": len(logged),
             "errors": [sum(1 for x in lines if x["level"] == "ERROR") for lines in logged],
             "warnings": [sum(1 for x in lines if x["level"] == "WARNING") for lines in logged],
@@ -620,6 +627,7 @@ def main(argv=None):
         # Leave the app where the next call starts: a pushed screen hides the tab bar, so the next
         # --ids --at <other screen> would fail in its first step.
         opened = next((x for x in (spec or {}).get("screens", []) if x["name"] == args.at), None) if args.at else None
+        back = None
         if opened and steps(opened.get("after"), plat):
             with tempfile.TemporaryDirectory(prefix="jigx-ids-") as tmp:
                 path = os.path.join(tmp, "after.yaml")
@@ -631,12 +639,22 @@ def main(argv=None):
                     back, why = proc.returncode == 0, maestro_failure(proc.stdout + proc.stderr, proc.returncode)
                 except subprocess.TimeoutExpired:
                     back, why = False, f"Maestro did not finish within {WARMUP_S} s"
-            if not back:
-                print(f"The screen's after steps failed ({why}): the app is still on {args.at}; go back by hand before the next call.",
-                      file=sys.stderr)
-        elif args.at or args.tap:
-            print("The app is left on this screen" + (f" ({args.at} has no after steps)" if args.at else "")
-                  + ": go back before the next call, or it starts from here.", file=sys.stderr)
+        if (args.at or args.tap) and not back:
+            # No after steps, or they failed: restart the app, so the next call starts from its start
+            # screen and not from this one (its prepare steps would fail on the hidden tab bar).
+            reason = (f"The screen's after steps failed ({why})" if back is False
+                      else f"{args.at} has no after steps" if args.at else "--tap left the app on this screen")
+            with tempfile.TemporaryDirectory(prefix="jigx-ids-") as tmp:
+                path = os.path.join(tmp, "restart.yaml")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(restart_flow(app_id))
+                try:
+                    done = subprocess.run([maestro] + (["--device", args.device] if args.device else []) + ["test", path],
+                                          capture_output=True, text=True, env=maestro_env(), timeout=WARMUP_S).returncode == 0
+                except subprocess.TimeoutExpired:
+                    done = False
+            print(f"{reason}: " + ("the app was restarted, so the next call starts from its start screen." if done
+                                   else "restarting the app failed too; go back by hand before the next call."), file=sys.stderr)
         return 0
     if not args.spec:
         p.error("give a spec file (or --ids)")

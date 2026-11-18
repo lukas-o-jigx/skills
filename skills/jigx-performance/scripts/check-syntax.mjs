@@ -4,6 +4,7 @@
 // parse as JSONata. Run it on the files a fix section changed, before publishing:
 //
 //   node check-syntax.mjs <solution folder> [changed.jigx ...] [--jsonata <dir>] [--yaml-only]
+//   node check-syntax.mjs <changed.jigx> [more.jigx ...]     (the solution folder is found above the file)
 //
 // YAML is parsed with the audit's own loader (Ruby). JSONata comes from the solution's own
 // node_modules, else the global npm folder (jsonata, or the one @jigx/core-sdk ships), else
@@ -53,7 +54,8 @@ export const forParser = expr => expr.replace(/@ctx\b/g, '$ctx').replace(/(^|[^\
 export function checkSyntax(folder, {files = [], jsonata = null} = {}) {
   const {app, sources, parseErrors} = loadSolution(folder);
   const only = new Set(files.map(f => path.relative(path.resolve(folder), path.resolve(f)).split(path.sep).join('/')));
-  const inScope = file => !only.size || only.has(file);
+  // The audit names the root file "index"; a changed index.jigx must still be in scope.
+  const inScope = file => !only.size || only.has(file) || (file === 'index' && only.has('index.jigx'));
   const yaml = parseErrors.filter(e => inScope(e.file));
   const expressions = [];
   walk(app, (v, p) => {
@@ -70,6 +72,17 @@ export function checkSyntax(folder, {files = [], jsonata = null} = {}) {
   return {yaml, expressions: expressions.length, errors, checkedJsonata: !!jsonata};
 }
 
+// A file given first: the solution folder is the nearest one above it that has index.jigx.
+export function solutionOf(file) {
+  let isFile = false;
+  try { isFile = fs.statSync(file).isFile(); } catch { return null; }
+  if (!isFile) return null;
+  for (let dir = path.dirname(path.resolve(file)); ; dir = path.dirname(dir)) {
+    if (fs.existsSync(path.join(dir, 'index.jigx'))) return dir;
+    if (path.dirname(dir) === dir) return path.dirname(path.resolve(file));
+  }
+}
+
 function main() {
   const args = process.argv.slice(2);
   const i = args.indexOf('--jsonata');
@@ -77,8 +90,14 @@ function main() {
   const y = args.indexOf('--yaml-only');
   const yamlOnly = y >= 0;
   if (yamlOnly) args.splice(y, 1);
-  const [folder, ...files] = args;
-  if (!folder) { console.error('usage: node check-syntax.mjs <solution folder> [changed.jigx ...] [--jsonata <dir>] [--yaml-only]'); process.exitCode = 2; return; }
+  const usage = 'usage: node check-syntax.mjs <solution folder> [changed.jigx ...] [--jsonata <dir>] [--yaml-only]\n' +
+    '       node check-syntax.mjs <changed.jigx> [more.jigx ...]   (the solution folder is found above the file)\n' +
+    'Exits 0 when everything parsed, 1 on an error, 2 when it could not check (no jsonata found).';
+  if (args.includes('--help') || args.includes('-h')) { console.log(usage); return; }
+  let [folder, ...files] = args;
+  if (!folder) { console.error(usage); process.exitCode = 2; return; }
+  const given1 = solutionOf(folder);
+  if (given1) { files = [folder, ...files]; folder = given1; }
   try {
     const found = yamlOnly ? null : findJsonata(folder, given);
     if (given && !yamlOnly && !(found && path.resolve(found.dir).startsWith(path.resolve(given))))

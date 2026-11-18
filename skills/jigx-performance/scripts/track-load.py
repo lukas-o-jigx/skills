@@ -28,9 +28,17 @@ run ends "invalid" once that sync finishes: arm first, then sign in. While nothi
 started it says when the app is syncing another solution instead, and after --start-timeout
 seconds (default 300) with nothing started it stops instead of waiting out --timeout.
 
+The app can start the whole sync again around the login page: every scope gets a new start
+before anything has synced. Those are the same sync, not repeats: a scope's time counts from
+the start it began to work in, and the time between the interruption and the last such restart
+is the login page. A run where the runtime never reported "interrupted" cannot be corrected
+(nothing in the database or the log marks the login page); compare-runs.py names it.
+
 The solution's state (what a `when:` guard reads) is saved at every scope start, as
 state_at_scope_start in the summary: the app persists it in its AsyncStorage (iOS Simulator
 only), so a guard that did not hold can be read from the run. --state prints it now.
+--source <solution folder> names the onFocus or onLoad in the source that starts a scope
+which synced more than once in the run (repeat_starters in the summary).
 
 Each sign-in run needs a fresh sign-in: start the tracker, then sign out of the app and
 sign in again (or sign in for the first time). With --scopes, names that match no scope are
@@ -240,15 +248,28 @@ def solution_id(path):
     return m.group(1).lower() if m else None
 
 
-def first_sign_in_after_install(db, armed, window_s=60):
+def created_ms(db):
+    """When the database file was created, or None (Android, or a file system without creation times)."""
+    try:
+        return None if db.startswith("adb:") else os.stat(db).st_birthtime * 1000
+    except (OSError, AttributeError):
+        return None
+
+
+def first_sign_in_after_install(db, armed, window_s=60, seen_before=False):
     """True when nobody has signed in to this install before: the solution database was created
     by this sign-in (within window_s before arming, or after it) and the app's log holds no
     sign-out from before arming. The first sign-in also loads the app and its other solutions, so
     it is slower than the runs after it. How long ago the app was installed does not matter: an
     app installed in the morning and first signed in to after lunch is still a first sign-in.
-    None when unknown (Android, or a file system without creation times)."""
+    A sign-out deletes the database and the next sign-in creates a new one, so a new database
+    alone says nothing: seen_before is what the tracker saw itself (the database was there when
+    tracking started, or a sign-out came by), and settles it without the log, which keeps only
+    its newest lines. None when unknown (Android, or a file system without creation times)."""
     if db.startswith("adb:"):
         return None
+    if seen_before:
+        return False
     try:
         born = os.stat(db).st_birthtime * 1000
     except (OSError, AttributeError):
@@ -269,8 +290,9 @@ SECRET_KEY = re.compile(r"token|password|secret|api[-_]?key|credential|authoriza
 
 def solution_state(db, full=False):
     """The solution's state as the app last persisted it, {name: value}, or None when it cannot
-    be read (Android, or no state saved yet). The app keeps it in React Native's AsyncStorage
-    under persist:solution -> instances[<solution id>].state, not in the solution database.
+    be read (Android, or no state saved yet). The app keeps it in React Native's AsyncStorage,
+    not in the solution database: under jigx.solution-state -> solutions[<solution id>] (app
+    3.12 and later), before that under persist:solution -> instances[<solution id>].state.
     Values under a name that looks like a credential are masked; others are cut to 120
     characters unless `full` (the copy time-queries.mjs binds parameters from needs them whole)."""
     sid = solution_id(db)
@@ -281,14 +303,22 @@ def solution_state(db, full=False):
         try:
             with open(manifest, encoding="utf-8") as f:
                 stored = json.load(f)
-            raw = stored.get("persist:solution")
-            if raw is None and "persist:solution" in stored:  # a large value lives in its own file
-                name = hashlib.md5(b"persist:solution").hexdigest()
-                with open(os.path.join(os.path.dirname(manifest), name), encoding="utf-8") as f:
-                    raw = f.read()
             unpack = lambda v: json.loads(v) if isinstance(v, str) else v
-            instances = unpack(unpack(raw or "{}").get("instances") or {})
-            state = next((unpack(v.get("state")) for k, v in instances.items() if k.lower() == sid and isinstance(v, dict)), None)
+
+            def stored_value(key):
+                raw = stored.get(key)
+                if raw is None and key in stored:  # a large value lives in its own file
+                    with open(os.path.join(os.path.dirname(manifest), hashlib.md5(key.encode()).hexdigest()), encoding="utf-8") as f:
+                        raw = f.read()
+                return unpack(raw or "{}")
+
+            mine = lambda group: next((unpack(v) for k, v in (unpack(group) or {}).items() if k.lower() == sid), None)
+            state = mine(stored_value("jigx.solution-state").get("solutions"))  # app 3.12+
+            if isinstance(state, dict) and isinstance(unpack(state.get("state")), dict) and set(state) <= {"state", "onLoadStatus", "version"}:
+                state = unpack(state["state"])
+            if not isinstance(state, dict):
+                old = mine(stored_value("persist:solution").get("instances"))
+                state = unpack(old.get("state")) if isinstance(old, dict) else None
         except (OSError, ValueError, AttributeError):
             continue
         if isinstance(state, dict):
@@ -482,12 +512,15 @@ def expression_errors(logs):
             for (e, err, sc), n in sorted(groups.items(), key=lambda kv: -kv[1])]
 
 
-def scope_runs(samples, armed):
-    """Every sync of every scope started after arming: {scope: [[start_ms, end_ms or None], ...]}.
+def scope_runs(samples, armed, paused=()):
+    """Every sync of every scope started after arming: {scope: [[start_ms, end_ms or None, resumed, active], ...]}.
     A scope that syncs again (a screen's onFocus after the sign-in sync) shows as a second run,
     which the final state alone hides: it keeps only the last start.
-    Each span is [start_ms, end_ms or None, resumed]: resumed when the run before it was
-    interrupted (the runtime restarts a scope after the OAuth login), so it is not a repeat."""
+    resumed: the same sync starting over, not a repeat. The runtime gives every scope of a sync a
+    new start when the sync restarts around the OAuth login, so a start is a resume when the run
+    before it was interrupted, when the run before it never got past "not started" (the scope was
+    still waiting for its turn), or when it falls in a login pause (`paused`).
+    active: the scope, or one of its entries, got past "not started" in this run."""
     runs, interrupted = {}, set()
     for sample in samples:
         for sid, v in sample["scopes"].items():
@@ -496,15 +529,24 @@ def scope_runs(samples, armed):
                 continue
             spans = runs.setdefault(sid, [])
             if not spans or spans[-1][0] != start:
-                if spans and spans[-1][1] is None:
-                    spans[-1][1] = start  # an unfinished run (interrupted) ends where the next one starts
-                spans.append([start, None, sid in interrupted])
+                resumed = False
+                if spans:
+                    if spans[-1][1] is None:
+                        spans[-1][1] = start  # an unfinished run (interrupted) ends where the next one starts
+                    resumed = (sid in interrupted or not spans[-1][3]
+                               or any(a <= start <= b + PAUSE_SLACK_MS for a, b in paused))
+                spans.append([start, None, resumed, False])
                 interrupted.discard(sid)
             if v.get("state") == "interrupted":
                 interrupted.add(sid)
+            if v.get("state") not in WAITING or any(e not in WAITING for e in (v.get("entries") or {}).values()):
+                spans[-1][3] = True
             if end and end >= start:
                 spans[-1][1] = end
     return runs
+
+
+PAUSE_SLACK_MS = 500  # a restart is seen one sample after the pause ended
 
 
 def paused_spans(samples, armed, only=None):
@@ -524,14 +566,41 @@ def paused_spans(samples, armed, only=None):
     if cur is not None:
         cur[1] = armed + samples[-1]["t"] * 1000
         spans.append(cur)
-    return spans
+    return spans if only else [[a, restarted_until(samples, armed, b)] for a, b in spans]
+
+
+def restarted_until(samples, armed, end):
+    """The end of a login pause that ended at `end`, moved to the last restart of the sync that
+    follows it before anything has synced. The app can start the whole sync again while the login
+    page is still open: every scope gets a new start and the identity scope reads "syncing", not
+    "interrupted", until the login is done and the sync restarts once more. Nothing syncs between
+    those restarts, so the time up to the last of them is still the login page."""
+    starts = None
+    for sample in samples:
+        fresh_scopes = {sid: v for sid, v in sample["scopes"].items() if v and (v.get("startedAt") or 0) >= armed}
+        now = {sid: v["startedAt"] for sid, v in fresh_scopes.items()}
+        if armed + sample["t"] * 1000 < end:
+            starts = now
+            continue
+        moved = [t for sid, t in now.items() if starts is not None and starts.get(sid) not in (None, t)]
+        if moved and min(moved) > end:
+            end = min(moved)
+        starts = now
+        if any(v.get("state") == "synced" or "synced" in (v.get("entries") or {}).values() for v in fresh_scopes.values()):
+            break
+    return end
 
 
 def first_sync_s(spans, paused=()):
-    """Seconds of a scope's first sync: its first start to the end of the last resume of it."""
+    """Seconds of a scope's first sync: its first start to the end of the last resume of it. A
+    start the scope only waited through (the sync was restarted before its turn came) is not
+    its sync: the time counts from the start it began to work in."""
     if not spans:
         return None
-    start, end, i = spans[0][0], spans[0][1], 1
+    first = 0
+    while first + 1 < len(spans) and spans[first + 1][2] and len(spans[first]) > 3 and not spans[first][3]:
+        first += 1
+    start, end, i = spans[first][0], spans[first][1], first + 1
     while i < len(spans) and spans[i][2]:  # resumed after an interruption: still the first sync
         end, i = spans[i][1], i + 1
     if end is None:
@@ -559,12 +628,12 @@ def busy_seconds(runs, until=None, paused=()):
 
 def summarise(label, db, samples, result, armed, ready_at, logs, final, scopes):
     run = tracked(final, scopes, armed) if final else {}
-    runs = scope_runs(samples, armed)
+    paused = paused_spans(samples, armed) if samples else []
+    runs = scope_runs(samples, armed, paused)
     starts = [v["startedAt"] for v in run.values() if v and v["startedAt"]]
     # The first start of a tracked scope, not its last: a second sync moves the final startedAt.
     starts += [spans[0][0] for sid, spans in runs.items() if sid in run]
     first_start = min(starts) if starts else None
-    paused = paused_spans(samples, armed) if samples else []
     entries = entry_timings(samples, armed)
     for e in entries.values():  # entry times are seconds since arming
         if e["duration_s"] is not None and paused:
@@ -625,13 +694,51 @@ def summarise(label, db, samples, result, armed, ready_at, logs, final, scopes):
     }
 
 
+TRIGGER = re.compile(r"\b(onFocus|onLoad|onRefresh|onTableChange)\b")
+
+
+def sync_starters(folder, scope, limit=5):
+    """Where the solution's source starts this sync scope from a screen event: "file:line onFocus"
+    for each onFocus, onLoad, onRefresh or onTableChange whose block names the scope (the sync
+    action's instanceId) or a global action that holds it. Read from the text of the .jigx and
+    .ts files, so it is a pointer to look at, not proof."""
+    files = []
+    for root, dirs, names in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", "dist", "build", "artifacts")]
+        files += [os.path.join(root, n) for n in names if n.endswith((".jigx", ".ts", ".tsx"))]
+    texts = {}
+    for path in sorted(files):
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            with open(path, encoding="utf-8") as f:
+                texts[path] = f.read().splitlines()
+    word = lambda name: re.compile(rf"(?<![\w-]){re.escape(name)}(?![\w-])")
+    # Global actions that run the scope: a screen starts it by naming the action.
+    names = {scope} | {os.path.splitext(os.path.basename(path))[0] for path, lines in texts.items()
+                       if os.sep + "actions" + os.sep in path and any(word(scope).search(l) for l in lines)}
+    found = []
+    for path, lines in texts.items():
+        for i, line in enumerate(lines):
+            m = TRIGGER.search(line)
+            if not m or line.lstrip().startswith(("#", "//")):
+                continue
+            indent = len(line) - len(line.lstrip())
+            block = [line[m.end():]]
+            for nxt in lines[i + 1:i + 200]:
+                if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= indent:
+                    break
+                block.append(nxt)
+            if any(word(n).search(l) for n in names for l in block):
+                found.append(f"{os.path.relpath(path, folder)}:{i + 1} {m.group(1)}")
+    return found[:limit]
+
+
 def samples_started(samples, scopes, armed):
     """Whether any tracked scope started in this run."""
     return any(status(x, scopes, armed) != "waiting" for x in samples)
 
 
 def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeout=900.0, stream=sys.stdout, unknown_wait=10.0,
-          remind_after=180.0, start_timeout=300.0):
+          remind_after=180.0, start_timeout=300.0, source=None):
     os.makedirs(out, exist_ok=True)
     log_db = os.path.join(os.path.dirname(db), "jigx.log.db")
     sol = solution_id(db)
@@ -644,6 +751,9 @@ def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeo
     announced, unknown_told, unknown_since, reminded = set(), set(), None, 0
     seen_starts, state_log, gave_up = {}, [], False
     inode = file_id(db)
+    # Signed in to before: the database is older than this tracking (a sign-out will replace it).
+    born = created_ms(db)
+    seen_before = born is not None and born < armed - 60000
     print(f"Tracking {solution_name(db)} as '{label}'. Start the load now: for a sign-in, sign out of the app and "
           "sign in again (every run needs a fresh sign-in); otherwise refresh or open the screen.",
           file=stream, flush=True)
@@ -661,7 +771,7 @@ def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeo
             signed_out = any(SIGN_OUT.search(r["message"]) for r in new_logs)
             if signed_out or recreated:
                 # A build that reloads can sync once before the sign-out: start this run again.
-                inode, restarts = file_id(db), restarts + 1
+                inode, restarts, seen_before = file_id(db), restarts + 1, seen_before or signed_out or inode is not None
                 armed, samples, logs, last_sig, ready_since, ready_at = now_ms(), [], [], None, None, None
                 before_arming.clear()
                 seen_starts, state_log = {}, []
@@ -735,7 +845,8 @@ def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeo
                     busy = [n for n in other_solutions_busy(db, armed) if n not in announced]
                     announced.update(busy)
                     if busy:
-                        print(f"{t:7.2f}s  The app is syncing {', '.join(busy)}, not {solution_name(db)}: "
+                        shown = ", ".join(busy[:3]) + (f" and {len(busy) - 3} more" if len(busy) > 3 else "")
+                        print(f"{t:7.2f}s  The app is syncing {len(busy)} other solution(s) ({shown}), not {solution_name(db)}: "
                               "switch to the test solution in the app.", file=stream, flush=True)
             else:
                 idle_since = None
@@ -754,8 +865,11 @@ def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeo
     summary["restarts"] = restarts
     summary["interval_s"] = interval
     summary["other_solutions_synced"] = sorted(announced)
-    summary["first_sign_in_after_install"] = first_sign_in_after_install(db, armed)
+    summary["first_sign_in_after_install"] = first_sign_in_after_install(db, armed, seen_before=seen_before)
     summary["state_at_scope_start"] = state_log
+    if source and summary["repeated_scopes"]:
+        # The screen events in the source that start a scope that synced again.
+        summary["repeat_starters"] = {sid: sync_starters(source, sid) for sid in summary["repeated_scopes"]}
     if result == "timeout" and not samples_started(samples, scopes, armed):
         summary["timeout_reason"] = "no sign-out seen and nothing started" if not restarts else "nothing started after the sign-out"
         if gave_up:
@@ -776,8 +890,11 @@ def track(db, label, out, tables=(), scopes=(), interval=0.25, settle=5.0, timeo
         print(f"Interrupted (e.g. the login page) {summary['interrupted_s']}s, not counted; "
               f"first start to ready with it: {summary['first_start_to_ready_raw_s']}s", file=stream)
     for sid in summary["repeated_scopes"]:
-        print(f"WARNING: {sid} synced {summary['scope_starts'][sid]} times in one run; look for an onFocus or "
-              "onLoad that starts the same sync again", file=stream)
+        starters = summary.get("repeat_starters", {}).get(sid)
+        print(f"WARNING: {sid} synced {summary['scope_starts'][sid]} times in one run; "
+              + (f"the source starts it from {', '.join(starters)}" if starters
+                 else "look for an onFocus or onLoad that starts the same sync again"
+                      + ("" if source else " (--source <solution folder> names them)")), file=stream)
         again = [x for x in state_log if x["scope"] == sid][1:2]
         held = again and next((x["state"] for x in reversed(state_log[:state_log.index(again[0]) + 1]) if isinstance(x["state"], dict)), None)
         if held:
@@ -817,6 +934,8 @@ def main(argv=None):
     p.add_argument("--timeout", type=float, default=900.0)
     p.add_argument("--start-timeout", type=float, default=300.0,
                    help="seconds to wait for the first scope to start (from arming, or from the sign-out) before stopping; 0 waits for --timeout")
+    p.add_argument("--source", metavar="FOLDER", help="the solution's source folder: a scope that syncs more than once in the run is "
+                   "then reported with the onFocus/onLoad in the source that starts it")
     p.add_argument("--state", action="store_true", help="print the solution's state as the app last saved it (iOS Simulator) and exit")
     p.add_argument("--copy-db", metavar="OUT", help="copy the solution database to OUT (rows in the -wal file included) and exit")
     args = p.parse_args(argv)
@@ -872,7 +991,7 @@ def main(argv=None):
         return 0
     scopes = [s for s in args.scopes.split(",") if s]
     summary = track(db, args.label, args.out, args.table, scopes, args.interval, args.settle, args.timeout,
-                    start_timeout=args.start_timeout)
+                    start_timeout=args.start_timeout, source=args.source)
     return 0 if summary["result"] == "ready" else 1
 
 

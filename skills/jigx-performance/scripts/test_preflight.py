@@ -37,6 +37,18 @@ class PreflightTest(unittest.TestCase):
         self.assertIn('git archive base/time-tracking/time-tracking-v2 "Time-Tracking-V2" | tar -x -C', out)
         missing = pf.code_only_text(pf.code_only(os.path.join(d, "Nope")))
         self.assertIn("No branch of this repository has a solution at Nope", missing)
+        # Peter's retest: a newer test branch was offered first although main has the folder
+        git("checkout", "-q", "-b", "release/4")
+        os.makedirs(os.path.join(d, "Shared"))
+        with open(os.path.join(d, "Shared", "index.jigx"), "w") as f:
+            f.write("name: shared\n")
+        git("add", "."); commit("shared on a release branch")
+        git("checkout", "-q", "-b", "test/date-storage")
+        with open(os.path.join(d, "note.txt"), "w") as f:
+            f.write("newer\n")
+        git("add", "."); commit("a newer test branch")
+        git("checkout", "-q", "main")
+        self.assertEqual(pf.code_only(os.path.join(d, "Shared"))["elsewhere"]["branches"], ["release/4", "test/date-storage"])
 
     def test_reports_solution_branch_and_changes(self):
         d = tempfile.mkdtemp()

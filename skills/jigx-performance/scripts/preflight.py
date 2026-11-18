@@ -197,6 +197,12 @@ def other_branches(folder, limit=5, scan=400):
         return None
     prefix = "" if rel == "." else rel + "/"
     refs = run(["git", "for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads", "refs/remotes"], top).split()
+    # The repository's main lines first (main, develop, a release branch), then the newest: the
+    # first one found is the one the copy command names, and a stray test branch is a poor default.
+    short = lambda ref: re.sub(r"^origin/", "", ref)
+    rank = lambda ref: 0 if short(ref) in ("main", "master") else 1 if short(ref) in ("develop", "dev") else \
+        2 if re.match(r"release[/-]", short(ref)) else 3
+    refs = sorted(refs, key=rank)  # stable: newest first within a rank
     found, seen = [], set()
     for ref in refs[:scan]:
         name = re.sub(r"^origin/", "", ref)

@@ -110,7 +110,10 @@ python3 <skill-directory>/scripts/time-screens.py <review>/screens.json --platfo
   reports the baseline alone. A sign-in sometimes shows no login page pause (the runtime
   does not report it), so password typing is timed as sync: `compare-runs.py` names that
   run (no pause where the others had one, or one call far slower than in the others);
-  run it again or exclude it. On a device with many solutions every sign-in syncs them
+  run it again or exclude it. A sync the app restarts around the login page is one sync:
+  the restarts are not repeats and the page is not timed. Pass `--source <solution folder>`
+  so a scope that really syncs twice is reported with the onFocus or onLoad that starts it.
+  On a device with many solutions every sign-in syncs them
   too, which it says once instead of on every run. A run nobody starts stops after
   `--start-timeout` (300 s). When a fix's `when:` guard does not stop a repeat sync, the
   summary's `state_at_scope_start` shows the solution state each scope started with.
