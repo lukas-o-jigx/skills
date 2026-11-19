@@ -65,7 +65,34 @@ python3 <skill-directory>/scripts/check-plans.py <solution> > <review>/before/pl
 in the source, and two or three of each medium type; drop a type whose samples are
 false, and say why, before proposing anything.
 
+**Find what the customer uses.** A solution built for many customers carries features
+this one has switched off; a fix there changes nothing for them.
+
+- Find the switches: values from a settings datasource or a solution setting that a
+  `when:`, a visibility condition or a menu filter compares with a constant. In
+  jigx-com/acumatica they are `@ctx.datasources.config-settings.feature<Name> = 'y'` and a
+  menu row's `featureFlag:`; `grep -rhoE "config-settings\.feature[A-Za-z0-9]+" <solution>
+  | sort | uniq -c` lists them. Read the repo's customization register too when it has one
+  (`customer-customizations.md`).
+- Read their values for this customer from the device database (the table the settings
+  datasource's query names; `track-load.py --list` finds the database). Tables that hold
+  0 rows after a full sync are a second sign that a feature is off.
+- Sort every confirmed finding: **on** (propose it), **off** (list it under "Not
+  proposed: `<switch>` is off for this customer"), **shared** (code that runs whatever
+  the switch says, such as a sync step with no `when:`; propose it). Show the list of
+  switches that are on in two or three lines, so the user can correct it.
+- With no device database, ask once which modules the customer uses, or say plainly
+  that the findings were not filtered by feature.
+
 ## 2. Time the current solution
+
+**Offer who runs it, in a few lines.** Do not paste the commands below at the user.
+Recommend running it yourself and name only what the user has to do, for example:
+"I'll copy the solution to `<review>/test-before`, track three sign-ins and time the 5
+screens (about 15 minutes). From you: 1. publish that folder to `<test solution>` in Jigx
+Builder, 2. sign in when I ask. Or I give you the steps and you run it." A publish is the
+user's step whenever their rules say so or the tool cannot do it (YAML): name the folder
+and the solution, wait for "done", then carry on without further questions.
 
 Publish the current build to the test solution, then record each area. Use the same
 simulator, user and data for every run, before and after.
@@ -187,8 +214,15 @@ screen size, start-up, sync shape, writes, credentials. Then present:
    - **why**: the finding and the time it costs (from step 2)
    - **expected effect** and **risk**
    - **how it will be verified**: which timing should move
-3. **Not proposed**: findings left alone and why (unreachable path, needs the API owner,
-   needs a product decision, accepted pattern).
+3. **Not proposed**: findings left alone and why (feature switched off for this
+   customer, unreachable path, needs the API owner, needs a product decision, accepted
+   pattern, no measurable gain expected).
+
+Be honest about small gains. A screen's time moves by about 300 ms between runs of the
+same build, so a change expected to save less cannot be shown and may measure slower by
+chance. A plain form (a few fields, no list, no per-row datasource reads) renders the
+same after most tidying: say there is little to gain, and propose such a change only as
+**Optional** for a reason other than speed (an expression error, fewer state writes).
 
 Propose a fix for **every expression error the runs logged** (`track-load.py` lists each
 with its expression and screen), not only the slow parts: a failing expression blanks
@@ -259,6 +293,24 @@ Show the user `<review>/report.md`:
   its likely cause, and what to try next
 - **Not verified**: what could not be measured, and that simulator and host timings show
   relative change, not a customer's device
+
+Then say what to merge. The report's "Keep or take out" lists every timing as faster,
+slower, unclear or not moved; turn it into one verdict per applied section, in the chat,
+before anything else:
+
+- **Keep**: the timing the section was meant to move got faster.
+- **No measurable change**: say so; do not call it slower or faster. Keep it only when it
+  fixes something else (an error, a risk, growth at 10x data) and name that; otherwise
+  recommend leaving it out.
+- **Slower**: time it again once (a background sync in some runs is the usual cause;
+  check the ready element still renders last). If it holds, say the change did not work,
+  offer to take that section's commit out and time again, and do not recommend merging it.
+  Find the cause before proposing it again (a rewritten query without its index, a
+  datasource moved to a screen that opens more often).
+
+End with one line: "Merge B and C. Leave E out: the forms measured the same or slower."
+A mixed result is a normal outcome; a report that says "improved" and "slower" with no
+advice leaves the user unable to decide.
 
 Offer it as a page for the customer. Say plainly when a step was not run or a number got
 worse.

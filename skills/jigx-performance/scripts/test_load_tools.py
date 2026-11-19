@@ -332,6 +332,20 @@ class ReviewReportTest(unittest.TestCase):
         self.assertIn("| query | `datasources/a` | 40 ms | 8 ms | -80% |", text)
         self.assertIn("| list | `-` | 2.10 s | 1.50 s | -28.6% | faster |", text)
 
+    def test_the_report_says_what_to_keep_and_what_to_take_out(self):
+        # Natalia's trial: line items got faster and the forms slower, and the report did not say what to do
+        self.write("before/static.json", {"byCode": {}})
+        self.assertNotIn("Keep or take out", rr.report(self.dir))  # baseline only: nothing to judge
+        row = lambda screen, b, a, verdict: {"screen": screen, "before_ms": b, "after_ms": a, "change_pct": 0, "verdict": verdict}
+        self.write("screens/pre.json", {"device": "sim", "runs": 3, "screens": {}})
+        self.write("screens/post.json", {"device": "sim", "runs": 3, "screens": {}, "comparison": {"rows": [
+            row("line-items", 2100, 1500, "faster"), row("form", 1200, 1600, "SLOWER"), row("home", 1000, 1050, "same")]}})
+        text = rr.report(self.dir)
+        self.assertIn("- **Faster, keep:** screen line-items (2.10 → 1.50 s).", text)
+        self.assertIn("- **Slower:** screen form (1.20 → 1.60 s). Time these again once.", text)
+        self.assertIn("- **No measurable change:** screen home (1.00 → 1.05 s).", text)
+        self.assertLess(text.index("Keep or take out"), text.index("## Sync"))
+
 
 
 class EntryTimingTest(unittest.TestCase):

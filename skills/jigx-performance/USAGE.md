@@ -29,7 +29,10 @@ Start with the code check; it needs nothing else installed.
      (`.jigx` or `src/*.ts`), grouped by section and ordered by priority; applies only
      what you approve; publishes to your **test** solution, times everything again and
      reports what got faster, what did not move, and any regression
-     (`report.md` in the review folder)
+     (`report.md` in the review folder), then says which changes to merge and which to
+     leave out. Claude runs the timing itself: you only publish to the test solution
+     and sign in when asked (or ask for the steps and run it yourself). Findings in
+     features your customer has switched off are listed apart, not fixed
    - **Fix the high findings now**, without timing
    - **Stop here**
 
@@ -184,6 +187,6 @@ YAML folder or an SDK `build/output.json`.
 | `time-screens.py` | screen and cold-start times through Maestro, iOS or Android (`--platform`, `--compare`; `--ids` prints the ids on the screen, `--at <screen>` / `--tap` get there first, name the step that failed, and go back afterwards, restarting the app when the screen has no `after` steps); a cold start also lists what the app logged, with the solution, screen and expression of each line |
 | `track-load.py` / `compare-runs.py` | live sync tracking in the iOS Simulator or an Android emulator (`--android`), and a database copy for the query timings (`--copy-db`); before/after medians and every run; a run unlike the others (the first sign-in after install, a login page that was not detected) is named, and `--exclude` leaves it out; with only `pre-*` runs it checks the baseline alone; the solution state at each scope start is saved (`--state` prints it); `--source <solution folder>` names the onFocus or onLoad behind a repeat sync |
 | `profile-query.py` | one query at 1x and 10x data, before and after an index |
-| `review-report.py` | the before/after report; leaves out the runs `compare-runs.py` excluded, keeps the query comparison at scaled data, and `--change "B: …" --files …` records a change in `changes.json` |
+| `review-report.py` | the before/after report, with "Keep or take out" (faster, slower, unclear, not moved) at the top; leaves out the runs `compare-runs.py` excluded, keeps the query comparison at scaled data, and `--change "B: …" --files …` records a change in `changes.json` |
 
 Tests: `node --test scripts/*.test.mjs` and `python3 -m unittest discover -s scripts`.

@@ -44,6 +44,17 @@ user-facing guide: every audit rule with its priority, and every script's flags.
   than `src/`. YAML solutions are the folder with `index.jigx`.
 - **Never publish to or time against production.** Change nothing in the solution before
   the user approves.
+- **Run it yourself; do not hand over a manual.** Copying, tracking, driving the
+  simulator, timing and comparing are yours to run. Before a timing round, offer two
+  ways in a few lines: **I run it** (recommended: one line on what you will do, then only
+  the user's own steps, numbered) or **you run it** (then the commands). Ask the user only
+  for what you cannot or may not do: a sign-in you cannot drive, and any publish their
+  rules keep for them. For that publish say the folder, the solution name and when, then
+  wait for "done".
+- **Propose only for what the customer uses.** Before reporting findings, find the
+  solution's feature switches and which are on (`references/customer-review.md`, step 1).
+  A finding in a feature that is switched off goes under "Not proposed" with the switch's
+  name, not into the fixes.
 
 ## Code check
 
@@ -66,7 +77,9 @@ Needs only Node 18+ (and Ruby for YAML). Do not mention devices or setup.
 3. **Confirm before you report.** Check every high finding in the source. For medium
    findings, check two or three of each type; when those are false, drop the type and
    say why (e.g. a table read only by a script). Review what the scan cannot see:
-   state, expressions, screen size, start-up work.
+   state, expressions, screen size, start-up work. Sort the findings by feature switch:
+   on, off, or not known (no device database; ask once which modules the customer uses,
+   or say the findings were not filtered).
 4. Show the counts by priority, then each confirmed finding as *what is wrong · where ·
    the fix*, grouped by section and headed by what the section means for the app
    (`SECTION_MEANING` in `check-performance.mjs`). Say where `audit.md` is.
@@ -113,7 +126,10 @@ Follow `references/customer-review.md` for the details of each step.
    in the solution's language with file, reason, measured cost, expected effect, risk
    and the timing that should move. Mark each **Needs fixing** (confirmed high or medium,
    a measured slow step, an expression error) or **Optional**, and list what is left
-   alone and why.
+   alone and why. Do not promise a gain the timing cannot show: a change expected to
+   save less than a screen's noise (250 ms), such as tidying a plain form with a few
+   fields and no per-row reads, is **Optional** with "no measurable gain expected", or
+   left alone.
 7. **Stop and ask.** Recommend every **Needs fixing** change; the user may pick sections.
 8. **Apply** approved sections one commit each on the fix branch. Read the repo's
    application guidance before changing sync, guard or write behaviour. After each
@@ -123,6 +139,12 @@ Follow `references/customer-review.md` for the details of each step.
    Compare with `compare-runs.py`, `time-queries.mjs --baseline` and
    `time-screens.py --compare`, and show `<review>/report.md`: what got faster, what did
    not move, any regression, what was not verified.
+9. **Say what to merge.** Give each applied section one verdict from the report's "Keep
+   or take out": **keep** (its timing got faster), **no measurable change** (keep only
+   when it fixes an error or a risk; say which), or **slower**. Time a slower result
+   again once; if it holds, offer to take that section's commit out and time again. Never
+   call a difference inside the noise slower or faster. End with one line the user can
+   act on: which sections to merge and which to leave out.
 
 ## While building
 
@@ -137,7 +159,8 @@ Follow `references/customer-review.md` for the details of each step.
    lookup that runs per row or per change.
 5. To time a change: three `track-load.py` runs on the old build (`--label pre-1..3`) and
    three on the new (`post-1..3`), same data and simulator, then `compare-runs.py`; put
-   its `comparison.md` in the PR (`references/run-and-track.md`).
+   its `comparison.md` in the PR (`references/run-and-track.md`). Run the trackers and
+   the comparison yourself; the user only publishes and signs in when you say.
 
 ## Guardrails
 

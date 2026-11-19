@@ -375,6 +375,40 @@ def screen_lines(pre, post):
                         "ready element, not what loads after it. unclear: the medians moved but the runs overlap; read the runs."]
 
 
+def keep_lines(comparison, timings_after, screens):
+    """What the second timing says about the changes: what paid off, what got slower and what did
+    not move. A tester found forms 'slower' after the fixes with no word on what to do about it."""
+    faster, slower, same, unclear = [], [], [], []
+    put = lambda verdict, text: (faster if verdict in ("faster", "improved") else slower if verdict in ("SLOWER", "REGRESSION")
+                                 else same if verdict in ("same", "within noise") else unclear).append(text)
+    if comparison and not comparison.get("baseline_only") and comparison.get("rows"):
+        t = comparison["rows"][0]
+        if t.get("after_s") is not None:
+            put(t["verdict"], f"sync, time to ready ({t['before_s']} → {t['after_s']} s)")
+    sec = lambda v: "-" if v is None else f"{v / 1000:.2f}"
+    for label, post in screens:
+        for r in ((post or {}).get("comparison") or {}).get("rows", []):
+            put(r["verdict"], f"{label} {r['screen']} ({sec(r.get('before_ms'))} → {sec(r.get('after_ms'))} s)")
+    for at, key in (("", "comparison"), (" at scaled data", "comparisonScaled")):
+        for r in (timings_after or {}).get(key) or []:
+            if r["verdict"] != "same":
+                put(r["verdict"], f"{KIND[r['kind']]} `{r['where']}`{at} ({r['before_ms']} → {r['after_ms']} ms)")
+    if not (faster or slower or same or unclear):
+        return []
+    lines = ["## Keep or take out", ""]
+    if faster:
+        lines.append(f"- **Faster, keep:** {'; '.join(faster)}.")
+    if slower:
+        lines.append(f"- **Slower:** {'; '.join(slower)}. Time these again once. If they are still slower, take out the "
+                     "change behind them (one commit per section) and time again; do not merge it as a performance fix.")
+    if unclear:
+        lines.append(f"- **Unclear:** {'; '.join(unclear)}. The runs overlap or cannot be compared: read the runs, time again.")
+    if same:
+        lines.append(f"- **No measurable change:** {'; '.join(same)}. A change that touches only these did not pay off on "
+                     "this data. Keep it only if it fixes something else (an error, a risk, growth at more data), and say which.")
+    return lines + [""]
+
+
 def report(folder, solution=None, timings=(None, None), exclude=()):
     before = findings(read(folder, "before", "static.json"), read(folder, "before", "plans.json"))
     after_static, after_plans = read(folder, "after", "static.json"), read(folder, "after", "plans.json")
@@ -395,6 +429,7 @@ def report(folder, solution=None, timings=(None, None), exclude=()):
     lines += overview(folder, pre, post, skip_android, timings_before, timings_after,
                       {"Screen": (screens_pre, screens_post), "Android screen": android_screens},
                       read(folder, "before", "static.json"), after_static)
+    lines += keep_lines(comparison, timings_after, [("screen", screens_post), ("Android screen", android_screens[1])])
     lines += ["## Sync", ""] + timing_lines(comparison, pre) + [""]
     lines += ["## Functions", ""] + function_lines(pre, post) + [""]
     lines += ["## Queries and actions", ""] + query_lines(timings_before, timings_after) + [""]
